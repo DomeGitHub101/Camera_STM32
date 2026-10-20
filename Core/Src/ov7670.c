@@ -147,6 +147,18 @@ static HAL_StatusTypeDef OV7670_WriteTable(const ov_reg_t *t)
   return HAL_OK;
 }
 
+HAL_StatusTypeDef OV7670_SetYUV(void)
+{
+  if (OV7670_WriteReg(0x12, 0x10) != HAL_OK) return HAL_ERROR;   /* COM7: QVGA + YUV */
+  /* A COM7 write can disturb other settings: re-apply the QVGA
+     window/scaling table, skipping its first entry (COM7 = RGB) */
+  if (OV7670_WriteTable(ov7670_qvga_regs + 1) != HAL_OK) return HAL_ERROR;
+  if (OV7670_WriteReg(0x40, 0xC0) != HAL_OK) return HAL_ERROR;   /* COM15: full 00-FF range, no RGB565 */
+  /* byte order: COM13 bit0 = 0 and TSLB bit3 = 0 -> Y U Y V (Y first) */
+  if (OV7670_WriteReg(0x3D, 0xC0) != HAL_OK) return HAL_ERROR;   /* COM13: gamma + UV auto */
+  return OV7670_WriteReg(0x3A, 0x04);                             /* TSLB */
+}
+
 uint8_t OV7670_Init(I2C_HandleTypeDef *hi2c)
 {
   uint8_t pid = 0, ver = 0;

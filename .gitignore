@@ -1,2 +1,4 @@
 Debug/
 Release/
+__pycache__/
+*.pyc

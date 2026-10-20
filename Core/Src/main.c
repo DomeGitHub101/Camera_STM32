@@ -39,7 +39,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define UART_BAUD    2000000  /* ST-LINK VCP; set the PC side (tools/ov7670_viewer.py) to match.
+                                 2 Mbaud = 54 MHz / 27 exactly. Garbage on the PC? use 921600 */
+#define SEND_FRAMES  1        /* 1 = send every captured frame to the PC over USART3 */
+#define SEND_GRAY    1        /* 1 = camera in YUV, send only Y = grayscale, 1 byte/pixel
+                                 0 = RGB565 colour, 2 bytes/pixel */
+#define GRAY_Y_OFFSET 0       /* which byte of each pixel pair is Y; image looks like noise? use 1 */
+#define SEND_SCALE   2        /* 1 = send 320x240, 2 = send 160x120 (4x less data, ~4x faster) */
+#define SEND_W       (OV7670_WIDTH / SEND_SCALE)
+#define SEND_H       (OV7670_HEIGHT / SEND_SCALE)
+#define SEND_BPP     (SEND_GRAY ? 1 : 2)
+#define SEND_BYTES   (SEND_W * SEND_H * SEND_BPP)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -149,6 +159,48 @@ static void bb_read_reg(uint8_t reg, char *msg, size_t n)
            reg, a1, a2, a3, v);
 }
 
+/* Send one frame to the PC:
+   AA 55 'F' type | width u16 LE | height u16 LE | pixels | byte sum u32 LE
+   type 'R' = RGB565 (high byte first), 'G' = 8-bit gray */
+#if SEND_GRAY || SEND_SCALE > 1
+static uint8_t send_buf[SEND_BYTES];
+#endif
+
+static void send_frame(void)
+{
+  uint8_t hdr[8] = {0xAA, 0x55, 'F', SEND_GRAY ? 'G' : 'R',
+                    SEND_W & 0xFF, SEND_W >> 8,
+                    SEND_H & 0xFF, SEND_H >> 8};
+#if SEND_GRAY || SEND_SCALE > 1
+  /* keep every SEND_SCALE-th pixel of every SEND_SCALE-th line;
+     in gray mode keep only the Y byte of each pixel */
+  uint32_t k = 0;
+  for (uint32_t y = 0; y < OV7670_HEIGHT; y += SEND_SCALE)
+    for (uint32_t x = 0; x < OV7670_WIDTH; x += SEND_SCALE) {
+      uint32_t i = (y * OV7670_WIDTH + x) * 2;
+#if SEND_GRAY
+      send_buf[k++] = frame_buf[i + GRAY_Y_OFFSET];
+#else
+      send_buf[k++] = frame_buf[i];
+      send_buf[k++] = frame_buf[i + 1];
+#endif
+    }
+  uint8_t *src = send_buf;
+#else
+  uint8_t *src = frame_buf;
+#endif
+  uint32_t sum = 0;
+  for (uint32_t i = 0; i < SEND_BYTES; i++) sum += src[i];
+
+  HAL_UART_Transmit(&huart3, hdr, sizeof hdr, 100);
+  for (uint32_t off = 0; off < SEND_BYTES; off += 32768) {
+    uint32_t n = SEND_BYTES - off;
+    if (n > 32768) n = 32768;
+    HAL_UART_Transmit(&huart3, src + off, n, 2000);
+  }
+  HAL_UART_Transmit(&huart3, (uint8_t *)&sum, 4, 100);
+}
+
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
 {
   frame_ready = 1;
@@ -218,6 +270,8 @@ int main(void)
   MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   MX_TIM2_Init();
+  huart3.Init.BaudRate = UART_BAUD;   /* 115200 is too slow for images (13 s per frame) */
+  HAL_UART_Init(&huart3);
   char msg[96];
   uart_print("\r\n=== OV7670 camera test ===\r\n");
 
@@ -282,6 +336,10 @@ int main(void)
            (unsigned long)ov7670_retry_count);
   uart_print(msg);
   if (r != OV7670_OK) while (1) {}
+#if SEND_GRAY
+  uart_print(OV7670_SetYUV() == HAL_OK ? "Step 2b: YUV mode (grayscale) OK\r\n"
+                                       : "Step 2b: FAIL - could not switch to YUV\r\n");
+#endif
 
   /* ---- Step 3a: are the camera sync signals toggling at all? ---- */
   uint32_t e_pclk  = count_edges(GPIOA, GPIO_PIN_6, 200);
@@ -312,6 +370,10 @@ int main(void)
 	        frames++;
 	        total++;
 	        frame_ready = 0;
+#if SEND_FRAMES
+	        SCB_InvalidateDCache_by_Addr((uint32_t *)frame_buf, OV7670_FRAME_BYTES);
+	        send_frame();   /* capture is stopped, so the buffer is not overwritten while sending */
+#endif
 	        HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT,
 	                           (uint32_t)frame_buf, OV7670_FRAME_BYTES / 4);
 	        t_cap = HAL_GetTick();
@@ -329,12 +391,18 @@ int main(void)
 	      }
 	      if (HAL_GetTick() - t_print >= 1000) {
 	        SCB_InvalidateDCache_by_Addr((uint32_t *)frame_buf, OV7670_FRAME_BYTES);
-	        /* centre pixel (RGB565, high byte first) */
 	        uint32_t c = ((OV7670_HEIGHT / 2) * OV7670_WIDTH + OV7670_WIDTH / 2) * 2;
+#if SEND_GRAY
+	        /* centre pixel brightness (Y byte) */
+	        snprintf(msg, sizeof msg, "fps=%lu total=%lu centre Y=%u\r\n",
+	                 (unsigned long)frames, (unsigned long)total, frame_buf[c + GRAY_Y_OFFSET]);
+#else
+	        /* centre pixel (RGB565, high byte first) */
 	        uint16_t px = (frame_buf[c] << 8) | frame_buf[c + 1];
 	        snprintf(msg, sizeof msg, "fps=%lu total=%lu centre=0x%04X R=%u G=%u B=%u\r\n",
 	                 (unsigned long)frames, (unsigned long)total, px,
 	                 (px >> 11) & 0x1F, (px >> 5) & 0x3F, px & 0x1F);
+#endif
 	        uart_print(msg);
 	        snprintf(msg, sizeof msg, "  dcmi: vsync=%lu lines=%lu dma_left=%lu/%u err=%lu code=0x%02lX restarts=%lu\r\n",
 	                 (unsigned long)vsync_cnt, (unsigned long)line_cnt,
