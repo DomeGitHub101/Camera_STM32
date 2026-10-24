@@ -27,6 +27,15 @@ uint8_t OV7670_Init(I2C_HandleTypeDef *hi2c);
 /* Call after OV7670_Init: output YUV422 (Y U Y V, 2 bytes/pixel) instead of
    RGB565. The Y bytes alone form a grayscale image. */
 HAL_StatusTypeDef OV7670_SetYUV(void);
+/* Call these after OV7670_SetYUV (it rewrites the registers they change) */
+/* 1 = 8-bar colour bar instead of the picture (bars are vertical: every row is the same) */
+HAL_StatusTypeDef OV7670_SetTestPattern(uint8_t on);
+/* Slow down PCLK and the frame rate: div 1 (normal), 2, 4 or 8 */
+HAL_StatusTypeDef OV7670_SetPclkDiv(uint8_t div);
+/* Anti-flicker for 50 Hz lights. frame_us = measured VSYNC period; a frame
+   is OV7670_FRAME_ROWS sensor rows (VGA timing, also used by QVGA) */
+#define OV7670_FRAME_ROWS   510
+HAL_StatusTypeDef OV7670_SetBanding50Hz(uint32_t frame_us);
 HAL_StatusTypeDef OV7670_WriteReg(uint8_t reg, uint8_t val);
 HAL_StatusTypeDef OV7670_ReadReg(uint8_t reg, uint8_t *val);
 

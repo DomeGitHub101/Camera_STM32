@@ -21,6 +21,8 @@
 #include "dcmi.h"
 #include "dma.h"
 #include "i2c.h"
+#include "spi.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -29,8 +31,10 @@
 #include "ov7670.h"
 #include "apriltag_lite.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "tim.h"
+#include "delivery.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,9 +44,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+/* ---- application ---- */
+#define APP_DELIVERY       1        /* 1 = table delivery on the LCD (cat face, touch, servo, link_send)
+                                       0 = tag -> command + video for tools/ov7670_viewer.py */
+#define DELIVERY_VIDEO     1        /* 1 = delivery mode also sends video to the viewer (needs 2 Mbaud) */
 /* ---- serial port (ST-LINK USB) ---- */
+#if APP_DELIVERY && !DELIVERY_VIDEO
+#define UART_BAUD          115200   /* text only (no video) */
+#else
 #define UART_BAUD          2000000  /* Tera Term and tools/ov7670_viewer.py must use this speed.
                                        2 Mbaud = 54 MHz / 27 exactly. Garbage? use 921600 */
+#endif
 /* ---- AprilTag (tag36h11) detection on the STM32 ---- */
 #define DET_SCALE          1        /* 1 = detect on 320x240 (longer range), 2 = on 160x120 (faster) */
 #define DET_W              (OV7670_WIDTH / DET_SCALE)
@@ -61,6 +73,14 @@
 /* ---- misc ---- */
 #define BOOT_DIAG          0        /* 1 = print the SCCB / I2C scan / sync-signal tests at start-up */
 #define GRAY_Y_OFFSET      0        /* which byte of each YUYV pixel pair is Y */
+/* ---- camera signal checks ---- */
+#define OV7670_TEST_PATTERN 0       /* 1 = colour bars instead of the picture (key p toggles at run time) */
+#define OV7670_PCLK_DIV    1        /* 1 = normal, 2 / 4 = slower PCLK for long jumper wires (fewer fps) */
+#define CAM_STATS          1        /* 1 = print a CAM: line (frame size / errors) with every result line */
+#define DROP_BAD_FRAMES    1        /* 1 = no tag detection on frames with wrong size or DCMI errors */
+#define FRAME_MARGIN       (4 * OV7670_WIDTH * 2)   /* DMA room for 4 extra lines, to measure long frames */
+#define CAP_BYTES          (OV7670_FRAME_BYTES + FRAME_MARGIN)
+#define ROW_TOLERANCE      12       /* test pattern: mean |Y difference| for a row to count as wrong */
 
 #if (VIDEO_SCALE % DET_SCALE) != 0
 #error "VIDEO_SCALE must be a multiple of DET_SCALE"
@@ -75,8 +95,11 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-__attribute__((aligned(32))) static uint8_t frame_buf[OV7670_FRAME_BYTES];   /* YUYV from the DCMI */
-static volatile uint8_t frame_ready = 0;
+__attribute__((aligned(32))) static uint8_t frame_buf[CAP_BYTES];   /* YUYV from the DCMI */
+static uint8_t           cap_running = 0;  /* a snapshot has been started and not yet collected */
+static volatile uint16_t cap_lines = 0;    /* lines (HREF pulses) received in the current snapshot */
+static volatile uint32_t cap_err = 0;      /* HAL_DCMI_ERROR_* bits seen during the current snapshot */
+static uint8_t           test_pattern = OV7670_TEST_PATTERN;
 static uint8_t gray[DET_W * DET_H];            /* Y plane = input of the tag detector */
 static uint8_t video_buf[VIDEO_W * VIDEO_H];   /* frame sent to the PC viewer */
 static at_config_t    at_cfg;
@@ -93,8 +116,8 @@ static const char *const tag_cmd[] = {
 #define NUM_TAG_CMDS ((int)(sizeof tag_cmd / sizeof tag_cmd[0]))
 
 static int      active_id = -1;       /* tag ID currently driving the robot, -1 = none */
-static int      cand_id = -1;         /* tag waiting for CONFIRM_FRAMES */
-static int      cand_count = 0;
+__attribute__((unused)) static int cand_id = -1;       /* tag waiting for CONFIRM_FRAMES */
+__attribute__((unused)) static int cand_count = 0;
 static uint32_t active_seen = 0;      /* tick when the active tag was last seen */
 static uint8_t  video_mode = 0;       /* 1 = viewer connected: also send frames + @ lines */
 static uint32_t output_delay = OUTPUT_DELAY_MS;
@@ -103,6 +126,13 @@ static uint32_t output_delay = OUTPUT_DELAY_MS;
 static uint32_t stat_frames = 0, stat_det_us = 0, stat_t0 = 0;
 static int            last_n = 0;     /* tags found in the latest frame */
 static at_detection_t last_best;      /* biggest of them */
+
+/* frame checks since the last result line */
+static struct {
+  uint32_t frames, good, short_, long_, ovr, other_err, timeout;
+  uint32_t lines_min, lines_max, bytes_min, bytes_max;
+  uint32_t row_bad_frames, rows_bad_max, order_ok, order_bad;
+} cam;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -225,17 +255,168 @@ static uint32_t count_edges(GPIO_TypeDef *port, uint16_t pin, uint32_t ms)
 }
 #endif /* BOOT_DIAG */
 
-/* ---- camera frames ---- */
-void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *h)
+/* ---- camera frames ----
+   A snapshot is started into a buffer a few lines bigger than a frame, so
+   the DMA never completes on a normal frame. The end of the frame is seen
+   in the main loop when the DCMI clears CAPTURE; the DMA counter then tells
+   how many bytes arrived, and the line interrupt how many lines. */
+void HAL_DCMI_LineEventCallback(DCMI_HandleTypeDef *h)
 {
-  frame_ready = 1;
+  if (h->Instance->CR & DCMI_CR_CAPTURE) cap_lines++;
 }
 
-static volatile uint8_t dcmi_err_pending = 0;
+/* VSYNC starts the blanking before a frame: lines counted so far belong to
+   the frame that was running when the snapshot was armed. At the end of the
+   captured frame CAPTURE is already clear, so its count is kept. */
+void HAL_DCMI_VsyncEventCallback(DCMI_HandleTypeDef *h)
+{
+  if (h->Instance->CR & DCMI_CR_CAPTURE) cap_lines = 0;
+}
 
 void HAL_DCMI_ErrorCallback(DCMI_HandleTypeDef *h)
 {
-  dcmi_err_pending = 1;
+  cap_err |= h->ErrorCode;
+  h->ErrorCode = HAL_DCMI_ERROR_NONE;
+}
+
+static void start_capture(void)
+{
+  cap_lines = 0;
+  cap_err = 0;
+  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buf, CAP_BYTES / 4);
+  /* the HAL turns these off after a frame event in snapshot mode */
+  __HAL_DCMI_ENABLE_IT(&hdcmi, DCMI_IT_LINE | DCMI_IT_VSYNC | DCMI_IT_OVR | DCMI_IT_ERR);
+  cap_running = 1;
+}
+
+/* Bytes the DMA took from the DCMI in this snapshot (call once CAPTURE is clear) */
+static uint32_t captured_bytes(void)
+{
+  uint32_t t0 = DWT->CYCCNT;
+  /* let the DMA empty the DCMI FIFO, at most ~100 us */
+  while ((hdcmi.Instance->SR & DCMI_SR_FNE) && DWT->CYCCNT - t0 < SystemCoreClock / 10000u) {}
+  return (CAP_BYTES / 4 - __HAL_DMA_GET_COUNTER(hdcmi.DMA_Handle)) * 4;
+}
+
+/* Test pattern: number of rows whose Y values differ from the middle row
+   (the colour bars are vertical, so every row should be the same) */
+static uint32_t count_bad_rows(void)
+{
+  const uint8_t *ref = frame_buf + (OV7670_HEIGHT / 2) * OV7670_WIDTH * 2 + GRAY_Y_OFFSET;
+  uint32_t bad = 0;
+  for (int y = 0; y < OV7670_HEIGHT; y++) {
+    const uint8_t *row = frame_buf + y * OV7670_WIDTH * 2 + GRAY_Y_OFFSET;
+    uint32_t diff = 0;
+    for (int x = 0; x < OV7670_WIDTH * 2; x += 2) diff += (uint32_t)abs(row[x] - ref[x]);
+    if (diff > ROW_TOLERANCE * OV7670_WIDTH) bad++;
+  }
+  return bad;
+}
+
+/* Test pattern: the first bar is white and the last black (or the other way
+   round when mirrored). Both have U = V = 128, so with the right byte order
+   the Y bytes differ a lot and the U/V bytes stay near 128. */
+static int yuyv_order_ok(void)
+{
+  uint32_t y_l = 0, y_r = 0, c_l = 0, c_r = 0, n = 0;
+  for (int y = 40; y < OV7670_HEIGHT - 40; y += 8)
+    for (int x = 4; x < 20; x++) {
+      const uint8_t *row = frame_buf + y * OV7670_WIDTH * 2;
+      int xr = OV7670_WIDTH - 1 - x;
+      y_l += row[x * 2 + GRAY_Y_OFFSET];
+      c_l += row[x * 2 + 1 - GRAY_Y_OFFSET];
+      y_r += row[xr * 2 + GRAY_Y_OFFSET];
+      c_r += row[xr * 2 + 1 - GRAY_Y_OFFSET];
+      n++;
+    }
+  y_l /= n; y_r /= n; c_l /= n; c_r /= n;
+  return abs((int)y_l - (int)y_r) > 80 && abs((int)c_l - 128) < 30 && abs((int)c_r - 128) < 30;
+}
+
+/* Record the checks of one finished snapshot; 1 = frame is good */
+static int check_frame(uint32_t bytes, uint32_t lines, uint32_t err)
+{
+  if (cam.frames == 0) {
+    cam.lines_min = cam.lines_max = lines;
+    cam.bytes_min = cam.bytes_max = bytes;
+  }
+  cam.frames++;
+  if (lines < cam.lines_min) cam.lines_min = lines;
+  if (lines > cam.lines_max) cam.lines_max = lines;
+  if (bytes < cam.bytes_min) cam.bytes_min = bytes;
+  if (bytes > cam.bytes_max) cam.bytes_max = bytes;
+
+  int good = 1;
+  if (bytes >= CAP_BYTES || lines > OV7670_HEIGHT) {
+    /* also raises an overrun once the buffer is full: not counted separately */
+    cam.long_++;
+    good = 0;
+  } else {
+    if (err & HAL_DCMI_ERROR_OVR) { cam.ovr++; good = 0; }
+    /* the HAL aborts the DMA after an overrun, which also sets ERROR_DMA */
+    if ((err & HAL_DCMI_ERROR_SYNC) || (err & (HAL_DCMI_ERROR_DMA | HAL_DCMI_ERROR_OVR)) == HAL_DCMI_ERROR_DMA) {
+      cam.other_err++;
+      good = 0;
+    }
+    if (bytes != OV7670_FRAME_BYTES || lines != OV7670_HEIGHT) {
+      if (bytes < OV7670_FRAME_BYTES || lines < OV7670_HEIGHT) cam.short_++;
+      else cam.long_++;
+      good = 0;
+    }
+  }
+
+  if (test_pattern && bytes >= OV7670_FRAME_BYTES) {
+    uint32_t rows = count_bad_rows();
+    if (rows) { cam.row_bad_frames++; good = 0; }
+    if (rows > cam.rows_bad_max) cam.rows_bad_max = rows;
+    if (yuyv_order_ok()) cam.order_ok++;
+    else cam.order_bad++;
+  }
+  if (good) cam.good++;
+  return good;
+}
+
+__attribute__((unused)) static void print_cam_stats(void)
+{
+  char line[256];
+  int len = snprintf(line, sizeof line,
+                     "  CAM: %lu frames, %lu good | short %lu long %lu overrun %lu err %lu timeout %lu",
+                     (unsigned long)cam.frames, (unsigned long)cam.good, (unsigned long)cam.short_,
+                     (unsigned long)cam.long_, (unsigned long)cam.ovr, (unsigned long)cam.other_err,
+                     (unsigned long)cam.timeout);
+  if (cam.frames)
+    len += snprintf(line + len, sizeof line - len, " | lines %lu-%lu (want %d) bytes %lu-%lu (want %d)",
+                    (unsigned long)cam.lines_min, (unsigned long)cam.lines_max, OV7670_HEIGHT,
+                    (unsigned long)cam.bytes_min, (unsigned long)cam.bytes_max, OV7670_FRAME_BYTES);
+  if (test_pattern)
+    len += snprintf(line + len, sizeof line - len, " | TEST bad-row frames %lu (max %lu rows), YUYV order %s",
+                    (unsigned long)cam.row_bad_frames, (unsigned long)cam.rows_bad_max,
+                    cam.order_bad == 0 ? "OK" : (cam.order_ok == 0 ? "WRONG" : "unstable"));
+  snprintf(line + len, sizeof line - len, "\r\n");
+  uart_print(line);
+  memset(&cam, 0, sizeof cam);
+}
+
+/* VSYNC (PG9) period in microseconds, median of 5; 0 = no VSYNC */
+static uint32_t measure_frame_us(void)
+{
+  uint32_t per[5], n = 0, t_prev = 0, t0 = HAL_GetTick();
+  uint32_t last = GPIOG->IDR & GPIO_PIN_9;
+  int edges = 0;
+  while (n < 5 && HAL_GetTick() - t0 < 2000) {
+    uint32_t now = GPIOG->IDR & GPIO_PIN_9;
+    if (now && !last) {
+      uint32_t t = DWT->CYCCNT;
+      uint32_t us = (t - t_prev) / (SystemCoreClock / 1000000u);
+      if (edges++ > 0 && us > 5000) per[n++] = us;   /* ignore glitches */
+      t_prev = t;
+    }
+    last = now;
+  }
+  if (n < 5) return 0;
+  for (int i = 1; i < 5; i++)                         /* sort, take the middle one */
+    for (int j = i; j > 0 && per[j] < per[j - 1]; j--) { uint32_t s = per[j]; per[j] = per[j - 1]; per[j - 1] = s; }
+  return per[2];
 }
 
 /* Copy the Y bytes of the YUYV frame into gray[] (every DET_SCALE-th pixel and line) */
@@ -249,12 +430,13 @@ static void extract_gray(void)
 }
 
 /* ---- tag -> command ---- */
-static const char *cmd_text(int id)
+__attribute__((unused)) static const char *cmd_text(int id)
 {
   if (id < 0) return "STOP (no tag)";
   return tag_cmd[id];
 }
 
+#if !APP_DELIVERY
 /* id = biggest tag with a command in this frame, -1 = none */
 static void update_command(int id, uint32_t now)
 {
@@ -288,16 +470,22 @@ static void print_status(uint32_t now)
            (unsigned long)(det10 / 10), (unsigned long)(det10 % 10),
            (unsigned long)(fps10 / 10), (unsigned long)(fps10 % 10));
   uart_print(line);
+#if CAM_STATS
+  print_cam_stats();
+#endif
   stat_frames = 0;
   stat_det_us = 0;
   stat_t0 = now;
 }
+#endif /* !APP_DELIVERY */
 
 static void print_help(void)
 {
   char line[100];
+#if !APP_DELIVERY
   uart_print("tag ID -> command: 0 STOP, 1 FORWARD, 2 TURN_LEFT, 3 TURN_RIGHT, 4 BACKWARD\r\n");
-  snprintf(line, sizeof line, "output delay %lu ms  (keys: + slower, - faster, h help)\r\n",
+#endif
+  snprintf(line, sizeof line, "output delay %lu ms  (keys: + slower, - faster, p test pattern, h help)\r\n",
            (unsigned long)output_delay);
   uart_print(line);
 }
@@ -308,7 +496,11 @@ static void handle_key(int c)
   char line[60];
   switch (c) {
   case 'v':
+#if APP_DELIVERY && !DELIVERY_VIDEO
+    uart_print("@MODE TEXT\r\n");   /* no video at 115200 baud: the viewer shows the text lines */
+#else
     video_mode = 1;
+#endif
     break;
   case 't':
     video_mode = 0;
@@ -320,6 +512,12 @@ static void handle_key(int c)
     if (c == '-' && output_delay >= OUTPUT_DELAY_MIN + OUTPUT_DELAY_STEP) output_delay -= OUTPUT_DELAY_STEP;
     snprintf(line, sizeof line, "output delay = %lu ms\r\n", (unsigned long)output_delay);
     uart_print(line);
+    break;
+  case 'p':
+    test_pattern = !test_pattern;
+    OV7670_SetTestPattern(test_pattern);
+    uart_print(test_pattern ? "test pattern ON (colour bars)\r\n" : "test pattern OFF\r\n");
+    memset(&cam, 0, sizeof cam);
     break;
   case 'h':
   case '?':
@@ -342,7 +540,11 @@ static void send_tag_lines(int n)
              (int)d->corners[2][0], (int)d->corners[2][1], (int)d->corners[3][0], (int)d->corners[3][1]);
     uart_print(line);
   }
+#if APP_DELIVERY
+  snprintf(line, sizeof line, "@CMD %s\r\n", delivery_status());   /* mission state for the viewer */
+#else
   snprintf(line, sizeof line, "@CMD %s\r\n", cmd_text(active_id));
+#endif
   uart_print(line);
 }
 
@@ -407,8 +609,9 @@ int main(void)
   MX_DCMI_Init();
   MX_USART3_UART_Init();
   MX_I2C2_Init();
-  /* USER CODE BEGIN 2 */
   MX_TIM2_Init();
+  MX_SPI5_Init();
+  /* USER CODE BEGIN 2 */
   huart3.Init.BaudRate = UART_BAUD;   /* 115200 is too slow for the video to the viewer */
   HAL_UART_Init(&huart3);
   char msg[96];
@@ -467,6 +670,37 @@ int main(void)
            pid, ver, DET_W, DET_H);
   uart_print(msg);
 
+  /* cycle counter for timing the detector and the VSYNC period */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->LAR = 0xC5ACCE55;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+  /* DCMI expects COM10 = 0: VSYNC high in blanking, HREF high on data, data valid on PCLK rising */
+  uint8_t com10 = 0;
+  OV7670_ReadReg(0x15, &com10);
+  if (com10 != 0x00) {
+    snprintf(msg, sizeof msg, "  WARNING: COM10 = 0x%02X, DCMI polarity setup expects 0x00\r\n", com10);
+    uart_print(msg);
+  }
+  if (OV7670_SetPclkDiv(OV7670_PCLK_DIV) != HAL_OK) uart_print("  WARNING: OV7670_PCLK_DIV must be 1, 2, 4 or 8\r\n");
+  if (test_pattern) OV7670_SetTestPattern(1);
+  HAL_Delay(200);   /* let the new clock settle */
+
+  /* the frame period gives the real sensor clock, which sets the 50 Hz anti-flicker step */
+  uint32_t frame_us = measure_frame_us();
+  if (frame_us && OV7670_SetBanding50Hz(frame_us) == HAL_OK) {
+    uint32_t pclk_khz = (uint32_t)((uint64_t)OV7670_FRAME_ROWS * 784u * 1000u / frame_us);
+    snprintf(msg, sizeof msg, "  frame %lu.%lu ms (%lu fps max), PCLK %lu.%02lu MHz, 50 Hz anti-flicker on\r\n",
+             (unsigned long)(frame_us / 1000), (unsigned long)(frame_us % 1000 / 100),
+             (unsigned long)(1000000u / frame_us),
+             (unsigned long)(pclk_khz / 1000), (unsigned long)(pclk_khz % 1000 / 10));
+  } else {
+    snprintf(msg, sizeof msg, "  WARNING: no VSYNC on PG9, 50 Hz anti-flicker not set\r\n");
+  }
+  uart_print(msg);
+  if (test_pattern) uart_print("  TEST PATTERN ON: colour bars instead of the picture\r\n");
+
 #if BOOT_DIAG
   snprintf(msg, sizeof msg, "  edges in 200 ms: PCLK=%lu HREF=%lu VSYNC=%lu\r\n",
            (unsigned long)count_edges(GPIOA, GPIO_PIN_6, 200),
@@ -477,15 +711,11 @@ int main(void)
 
   at_default_config(&at_cfg);
   print_help();
+#if APP_DELIVERY
+  delivery_init();   /* LCD, touch, pan servo */
+#endif
 
-  /* cycle counter for timing the detector */
-  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-  DWT->LAR = 0xC5ACCE55;
-  DWT->CYCCNT = 0;
-  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-
-  frame_ready = 0;
-  HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buf, OV7670_FRAME_BYTES / 4);
+  start_capture();
   uint32_t t_cap = HAL_GetTick();
   uint32_t t_out = HAL_GetTick();
   stat_t0 = t_out;
@@ -501,29 +731,42 @@ int main(void)
     int key = uart_getc();
     if (key >= 0) handle_key(key);
 
-    if (frame_ready) {
+    /* in snapshot mode the DCMI clears CAPTURE at the end of the frame */
+    if (cap_running && !(hdcmi.Instance->CR & DCMI_CR_CAPTURE)) {
+      cap_running = 0;
+      uint32_t bytes = captured_bytes();
+      uint32_t lines = cap_lines, err = cap_err;
       HAL_DCMI_Stop(&hdcmi);
-      frame_ready = 0;
-      SCB_InvalidateDCache_by_Addr((uint32_t *)frame_buf, OV7670_FRAME_BYTES);
+      SCB_InvalidateDCache_by_Addr((uint32_t *)frame_buf, CAP_BYTES);
+      int good = check_frame(bytes, lines, err);
       extract_gray();
       /* the next frame is captured while this one is processed */
-      HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buf, OV7670_FRAME_BYTES / 4);
+      start_capture();
       t_cap = HAL_GetTick();
 
-      uint32_t c0 = DWT->CYCCNT;
-      int n = at_detect(&at_cfg, gray, DET_W, DET_H, dets, AT_MAX_DETECT);
-      stat_det_us += (DWT->CYCCNT - c0) / (SystemCoreClock / 1000000u);
-      stat_frames++;
+      /* a bad frame gets no detection, but the viewer still shows what the DCMI received */
+      int n = 0;
+      if (good || !DROP_BAD_FRAMES) {
+        uint32_t c0 = DWT->CYCCNT;
+        n = at_detect(&at_cfg, gray, DET_W, DET_H, dets, AT_MAX_DETECT);
+        stat_det_us += (DWT->CYCCNT - c0) / (SystemCoreClock / 1000000u);
+        stat_frames++;
 
-      /* biggest (= closest) tag overall, and biggest tag that has a command */
-      int best = -1, best_cmd = -1;
-      for (int i = 0; i < n; i++) {
-        if (best < 0 || dets[i].side > dets[best].side) best = i;
-        if (dets[i].id < NUM_TAG_CMDS && (best_cmd < 0 || dets[i].side > dets[best_cmd].side)) best_cmd = i;
+        /* biggest (= closest) tag overall, and biggest tag that has a command */
+        int best = -1, best_cmd = -1;
+        for (int i = 0; i < n; i++) {
+          if (best < 0 || dets[i].side > dets[best].side) best = i;
+          if (dets[i].id < NUM_TAG_CMDS && (best_cmd < 0 || dets[i].side > dets[best_cmd].side)) best_cmd = i;
+        }
+        last_n = n;
+        if (best >= 0) last_best = dets[best];
+#if APP_DELIVERY
+        (void)best_cmd;
+        delivery_frame(dets, n, DET_W, HAL_GetTick());
+#else
+        update_command(best_cmd >= 0 ? dets[best_cmd].id : -1, HAL_GetTick());
+#endif
       }
-      last_n = n;
-      if (best >= 0) last_best = dets[best];
-      update_command(best_cmd >= 0 ? dets[best_cmd].id : -1, HAL_GetTick());
 
       if (video_mode) {
         send_tag_lines(n);
@@ -534,20 +777,24 @@ int main(void)
     /* command tag gone for too long -> STOP */
     if (active_id >= 0 && HAL_GetTick() - active_seen > TAG_LOST_MS) active_id = -1;
 
-    /* An error aborts the capture, and a VSYNC glitch ends a snapshot early
-       (the HAL frame callback only fires once the DMA buffer is full):
-       restart the capture in both cases */
-    if (dcmi_err_pending || HAL_GetTick() - t_cap > 500) {
-      dcmi_err_pending = 0;
+    /* no end of frame for 500 ms (VSYNC missing): restart the capture */
+    if (HAL_GetTick() - t_cap > 500) {
+      cam.timeout++;
       HAL_DCMI_Stop(&hdcmi);
-      HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT, (uint32_t)frame_buf, OV7670_FRAME_BYTES / 4);
+      start_capture();
       t_cap = HAL_GetTick();
     }
 
+#if APP_DELIVERY
+    /* touch, servo, face, and the TABLE / FOUND / -> $D lines every output_delay */
+    delivery_poll(HAL_GetTick(), output_delay);
+    (void)t_out;
+#else
     if (HAL_GetTick() - t_out >= output_delay) {
       t_out = HAL_GetTick();
       print_status(t_out);
     }
+#endif
   }
   /* USER CODE END 3 */
 }

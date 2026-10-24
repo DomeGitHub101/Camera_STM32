@@ -15,13 +15,18 @@ Protocol (Core/Src/main.c):
 Tera Term and this viewer use the same COM port: close one before opening the other.
 
 Install:  pip install pyserial numpy opencv-python
-Run:      python ov7670_viewer.py            (finds the ST-LINK port by itself)
+Run:      python ov7670_viewer.py            (finds the ST-LINK port and the speed by itself)
           python ov7670_viewer.py COM5 --baud 2000000
+
+APP_DELIVERY firmware (LCD cat face) runs at 115200 with no video: it answers
+'v' with "@MODE TEXT" and the window then shows its output lines instead
+(TABLE / FOUND / INVALID / ARRIVED / NOT FOUND / CANCEL / -> $D commands).
 Keys in the image window:  s = save PNG,  q / Esc = quit
 """
 import argparse
 import sys
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -103,9 +108,55 @@ def draw(view, tags, command, scale_x, scale_y):
         cv2.rectangle(view, (x - 3, ty - th - 4), (x - 3 + tw + 6, ty + 3), color, -1)
         cv2.putText(view, label, (x, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1, cv2.LINE_AA)
     if command:
-        text = f"STM32 CMD: {command}"
+        text = f"STM32: {command}"
         cv2.rectangle(view, (0, 0), (view.shape[1], 30), (0, 0, 0), -1)
         cv2.putText(view, text, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 1, cv2.LINE_AA)
+
+
+# Text mode (APP_DELIVERY firmware, 115200 baud, no video): colour per line type (BGR)
+LINE_COLORS = [
+    ("TABLE", (15, 101, 232)),       # orange
+    ("FOUND", (127, 208, 53)),       # green
+    ("ARRIVED", (127, 208, 53)),
+    ("INVALID", (79, 91, 255)),      # red
+    ("NOT FOUND", (60, 154, 255)),   # light orange
+    ("CANCEL", (243, 238, 233)),
+    ("->", (230, 200, 90)),          # commands for the lower board
+    ("TOUCH", (150, 150, 150)),
+]
+
+
+def draw_log(lines, port, baud):
+    """Window with the latest text lines from the STM32 (no video in this mode)"""
+    w, line_h = 760, 24
+    view = np.full((40 + line_h * len(lines) + 10, w, 3), (36, 26, 15), np.uint8)
+    cv2.putText(view, f"STM32 output  {port} @ {baud}  (text mode, no video)", (10, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (243, 238, 233), 1, cv2.LINE_AA)
+    for i, line in enumerate(lines):
+        color = next((c for key, c in LINE_COLORS if line.startswith(key)), (200, 200, 200))
+        cv2.putText(view, line[:90], (10, 60 + i * line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1,
+                    cv2.LINE_AA)
+    return view
+
+
+def draw_events(view, lines):
+    """Latest STM32 result lines (TABLE / FOUND / INVALID / -> $D ...) at the bottom of the video"""
+    if not lines:
+        return
+    line_h = 22
+    top = view.shape[0] - line_h * len(lines) - 6
+    overlay = view.copy()
+    cv2.rectangle(overlay, (0, top), (view.shape[1], view.shape[0]), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, view, 0.4, 0, view)
+    for i, line in enumerate(lines):
+        color = next((c for key, c in LINE_COLORS if line.startswith(key)), (200, 200, 200))
+        cv2.putText(view, line[:70], (8, top + 17 + i * line_h), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1,
+                    cv2.LINE_AA)
+
+
+def looks_like_text(line):
+    printable = sum(32 <= ord(ch) < 127 for ch in line)
+    return len(line) >= 4 and printable >= 0.9 * len(line)
 
 
 def find_port():
@@ -119,7 +170,8 @@ def find_port():
 def main():
     ap = argparse.ArgumentParser(description="Show the OV7670 camera and the tags the STM32 detects")
     ap.add_argument("port", nargs="?", help="serial port, e.g. COM5 (default: auto-detect ST-LINK)")
-    ap.add_argument("--baud", type=int, default=2000000, help="must match UART_BAUD in main.c")
+    ap.add_argument("--baud", type=int, default=0,
+                    help="must match UART_BAUD in main.c (default: try 2000000 and 115200)")
     ap.add_argument("--scale", type=int, default=0,
                     help="window zoom factor (default: auto, about 640 px wide)")
     args = ap.parse_args()
@@ -129,25 +181,42 @@ def main():
         ports = ", ".join(p.device for p in list_ports.comports()) or "none"
         sys.exit(f"ST-LINK port not found, pass it explicitly (available: {ports})")
 
+    bauds = [args.baud] if args.baud else [2000000, 115200]   # video firmware, delivery (text) firmware
+    baud_i = 0
+    locked = bool(args.baud)
     try:
-        ser = serial.Serial(port, args.baud, timeout=0.05)
+        ser = serial.Serial(port, bauds[0], timeout=0.05)
     except serial.SerialException as e:
         sys.exit(f"cannot open {port}: {e}\n(is Tera Term still connected to it?)")
-    print(f"Listening on {port} @ {args.baud} baud. Asking the STM32 for video...")
+    print(f"Listening on {port} @ {bauds[0]} baud. Asking the STM32 for video...")
 
     parser = StreamParser()
     garbage_warned = False
     pending_tags, shown_tags, command = [], [], ""
     image = None
     frames = 0
+    text_mode = False
+    log = deque(maxlen=16)
     t_last = time.time()
     t_ask = 0.0
+    t_baud = time.time()
     cv2.namedWindow("OV7670", cv2.WINDOW_AUTOSIZE)
+    cv2.imshow("OV7670", draw_log(["waiting for the STM32 ..."], port, ser.baudrate))
 
     try:
         while True:
-            # ask for video until frames arrive (also after a board reset)
-            if time.time() - t_last > 2 and time.time() - t_ask > 2:
+            # not sure of the speed yet: switch between the two firmware speeds
+            if not locked and time.time() - t_baud > 2.5:
+                baud_i = (baud_i + 1) % len(bauds)
+                ser.baudrate = bauds[baud_i]
+                parser = StreamParser()
+                t_baud = time.time()
+                t_ask = 0.0
+                print(f"[viewer] trying {ser.baudrate} baud")
+
+            # ask for video until frames arrive (also after a board reset);
+            # delivery firmware answers "@MODE TEXT" instead
+            if not text_mode and time.time() - t_last > 2 and time.time() - t_ask > 2:
                 ser.write(b"v")
                 t_ask = time.time()
 
@@ -155,6 +224,19 @@ def main():
             for item in parser.feed(data):
                 if item[0] == "line":
                     line = item[1]
+                    if not locked and looks_like_text(line):
+                        locked = True
+                        print(f"[viewer] STM32 found at {ser.baudrate} baud")
+                    if line.startswith("@MODE TEXT"):
+                        if not text_mode:
+                            print("[viewer] delivery firmware: text only (no video), showing its output")
+                        text_mode = True
+                        cv2.imshow("OV7670", draw_log(list(log), port, ser.baudrate))
+                        continue
+                    if looks_like_text(line) and not line.startswith("@"):
+                        log.append(line)
+                    if text_mode and looks_like_text(line):
+                        cv2.imshow("OV7670", draw_log(list(log), port, ser.baudrate))
                     if line.startswith("@TAG"):
                         f = line.split()
                         if len(f) == 12:
@@ -166,9 +248,9 @@ def main():
                         command = line[5:]
                         continue
                     if line.count("�") > len(line) // 2:
-                        if not garbage_warned:
+                        if locked and not garbage_warned:
                             print(f"[viewer] receiving garbage -> baud mismatch. Does UART_BAUD in main.c "
-                                  f"match --baud {args.baud}?")
+                                  f"match {ser.baudrate}?")
                             garbage_warned = True
                         continue
                     print(line)
@@ -181,11 +263,13 @@ def main():
                     shown_tags, pending_tags = pending_tags, []
                     frames += 1
                     t_last = time.time()
+                    locked = True
 
                     scale = args.scale or max(1, 640 // w)
                     view = cv2.resize(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), (w * scale, h * scale),
                                       interpolation=cv2.INTER_NEAREST)
                     draw(view, shown_tags, command, w * scale, h * scale)
+                    draw_events(view, list(log)[-4:])
                     cv2.imshow("OV7670", view)
 
             key = cv2.waitKey(1) & 0xFF

@@ -97,9 +97,8 @@ static const ov_reg_t ov7670_qvga_regs[] = {
      side, adjust HSTART (0x17) / HSTOP (0x18) by +-1. */
   {0x17, 0x16}, {0x18, 0x04}, {0x32, 0x24},
   {0x19, 0x02}, {0x1A, 0x7A}, {0x03, 0x0A},
-  /* Clock: Fint = XCLK * PLL / (2 * (CLKRC + 1))
-     XCLK 16 MHz, DBLV 0x4A (PLL x4), CLKRC 0x01 -> 16 MHz, ~20 fps max.
-     Picture noisy/torn on long wires? use CLKRC 0x03 (half speed). */
+  /* Clock: XCLK 13.5 MHz, DBLV 0x4A (PLL x4), CLKRC 0x01. PCLK is half the
+     internal clock (COM14). Slow it down with OV7670_SetPclkDiv(). */
   {0x6B, 0x4A},              /* DBLV */
   {0x11, 0x01},              /* CLKRC */
   {0x1E, 0x07},              /* MVFP: set 0x27 to mirror, 0x17 to flip */
@@ -157,6 +156,51 @@ HAL_StatusTypeDef OV7670_SetYUV(void)
   /* byte order: COM13 bit0 = 0 and TSLB bit3 = 0 -> Y U Y V (Y first) */
   if (OV7670_WriteReg(0x3D, 0xC0) != HAL_OK) return HAL_ERROR;   /* COM13: gamma + UV auto */
   return OV7670_WriteReg(0x3A, 0x04);                             /* TSLB */
+}
+
+HAL_StatusTypeDef OV7670_SetTestPattern(uint8_t on)
+{
+  /* test_pattern[1:0] = SCALING_YSC bit7 : SCALING_XSC bit7, 10 = 8-bar colour bar */
+  uint8_t xsc, ysc;
+  if (OV7670_ReadReg(0x70, &xsc) != HAL_OK || OV7670_ReadReg(0x71, &ysc) != HAL_OK) return HAL_ERROR;
+  if (OV7670_WriteReg(0x70, xsc & 0x7F) != HAL_OK) return HAL_ERROR;
+  return OV7670_WriteReg(0x71, on ? (ysc | 0x80) : (ysc & 0x7F));
+}
+
+HAL_StatusTypeDef OV7670_SetPclkDiv(uint8_t div)
+{
+  /* CLKRC 0x01 is the normal speed; the internal clock divides by CLKRC+1 */
+  if (div != 1 && div != 2 && div != 4 && div != 8) return HAL_ERROR;
+  return OV7670_WriteReg(0x11, (uint8_t)(2 * div - 1));
+}
+
+HAL_StatusTypeDef OV7670_SetBanding50Hz(uint32_t frame_us)
+{
+  if (frame_us == 0) return HAL_ERROR;
+  /* banding step = sensor rows in one half period of the mains (10 ms at 50 Hz) */
+  uint32_t row_ns = frame_us * 1000u / OV7670_FRAME_ROWS;
+  uint32_t bd50 = (10000000u + row_ns / 2) / row_ns;
+  uint32_t bd60 = (8333333u + row_ns / 2) / row_ns;
+  if (bd50 < 1) bd50 = 1;
+  if (bd50 > 255) bd50 = 255;
+  if (bd60 < 1) bd60 = 1;
+  if (bd60 > 255) bd60 = 255;
+  uint32_t max50 = OV7670_FRAME_ROWS / bd50, max60 = OV7670_FRAME_ROWS / bd60;
+  if (max50 < 1) max50 = 1;
+  if (max50 > 0x3F) max50 = 0x3F;
+  if (max60 < 1) max60 = 1;
+  if (max60 > 0x3F) max60 = 0x3F;
+
+  uint8_t com8;
+  if (OV7670_WriteReg(0x9D, (uint8_t)bd50) != HAL_OK) return HAL_ERROR;   /* BD50ST */
+  if (OV7670_WriteReg(0x9E, (uint8_t)bd60) != HAL_OK) return HAL_ERROR;   /* BD60ST */
+  if (OV7670_WriteReg(0xA5, (uint8_t)max50) != HAL_OK) return HAL_ERROR;  /* BD50MAX */
+  if (OV7670_WriteReg(0xAB, (uint8_t)max60) != HAL_OK) return HAL_ERROR;  /* BD60MAX */
+  /* COM11: 50/60 Hz auto-detect off, use BD50ST, exposure may go below
+     one step in very bright light */
+  if (OV7670_WriteReg(0x3B, 0x0A) != HAL_OK) return HAL_ERROR;
+  if (OV7670_ReadReg(0x13, &com8) != HAL_OK) return HAL_ERROR;
+  return OV7670_WriteReg(0x13, com8 | 0x20);                              /* COM8: banding filter on */
 }
 
 uint8_t OV7670_Init(I2C_HandleTypeDef *hi2c)
