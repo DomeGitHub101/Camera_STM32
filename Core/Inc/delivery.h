@@ -11,8 +11,9 @@
 
 /* screen + servo; call once after the camera is running */
 void delivery_init(void);
-/* after every good camera frame (img_w = width of the image the tags were found in) */
-void delivery_frame(const at_detection_t *dets, int n, int img_w, uint32_t now);
+/* after every good camera frame: img_w x img_h = image the tags were found in,
+   rotation = clockwise turn (0/90/180/270) that makes that image upright */
+void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int rotation, uint32_t now);
 /* every main-loop pass: touch, servo sweep, timers, link heartbeat every output_delay ms */
 void delivery_poll(uint32_t now, uint32_t output_delay);
 

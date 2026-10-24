@@ -5,8 +5,13 @@
  * Page 2: the pan servo (PD14, TIM4_CH3) sweeps until the target tag is
  * seen in CONFIRM_TAG_FRAMES frames in a row, then follows it. Only the
  * target tag drives the servo, so it never locks on a wrong tag. Wrong tags
- * are reported once per tag per mission. At ARRIVE_MM or closer the mission
- * is done. Drive commands for the lower board go out through link_send().
+ * are reported once per tag per mission.
+ *
+ * Driving: decide_drive() turns the target's bearing and distance into one
+ * command {speed, turn} plus a readable hint (MOVE CLOSER / MOVE BACK /
+ * TURN LEFT / TURN RIGHT / HOLD). Without the wheel board the hints are only
+ * printed; the same {speed, turn} goes to link_send() for the lower board.
+ * In position (centred and at TARGET_DIST_MM) for HOLD_TIME_MS = arrived.
  */
 #include "delivery.h"
 #include "cat_ui.h"
@@ -14,13 +19,14 @@
 #include "usart.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- tag geometry: distance = CAM_FOCAL_PX * TAG_SIZE_MM / side in pixels ---- */
-#define TAG_SIZE_MM        100.0f   /* edge of the BLACK square of the printed tag */
-#define CAM_FOCAL_PX       340.0f   /* at 320 px image width; calibrate: new = old * real / printed distance */
+#define TAG_SIZE_MM        142.0f   /* edge of the BLACK square of the printed tag (measured 14.2 cm) */
+#define CAM_FOCAL_PX       418.0f   /* at 320 px image width; calibrated: 30 cm read 172 mm with 100 mm / 340 px.
+                                       re-calibrate: new = old * real / printed distance */
 #define CONFIRM_TAG_FRAMES 3        /* same tag in this many frames in a row before it counts */
-#define ARRIVE_MM          800      /* this close to the target tag = arrived */
 #define ARRIVED_SHOW_MS    5000
 #define NOT_FOUND_SHOW_MS  2500
 #define WRONG_SHOW_MS      1600     /* red eyes + text after a wrong tag */
@@ -29,15 +35,24 @@
 /* ---- pan servo: PD14 = TIM4_CH3, 50 Hz, 500..2500 us = -90..+90 deg ---- */
 #define SERVO_CENTER_US    1500
 #define SERVO_US_PER_90    1000
+#define PAN_SERVO_ENABLED  0        /* 0 = no servo yet: the camera looks straight ahead and never sweeps */
 #define PAN_SERVO_DIR      1        /* -1 if the camera turns left when it should turn right */
 #define PAN_LIMIT_DEG      90
 #define SWEEP_DEG_PER_S    45
 #define SEARCH_TIMEOUT_MS  15000    /* keep searching this long after picking a table (or after losing it) */
-#define PAN_GAIN           0.5f     /* part of the tag's angle corrected per frame */
-/* ---- drive commands ---- */
-#define DRIVE_SPEED        200      /* speed while facing the tag */
+#define PAN_DEADBAND_DEG   8        /* tag within +- this of the image centre: servo stays still */
+#define SETTLE_FRAMES      2        /* frames after a servo move that were (partly) taken while it moved */
+/* ---- drive commands: get the tag centred at TARGET_DIST_MM ---- */
+#define TARGET_DIST_MM     800      /* stop this far from the tag */
+#define DIST_TOL_MM        100      /* +- this is close enough */
+#define CENTER_TOL_DEG     5        /* tag within +- this of straight ahead is centred */
 #define ALIGN_DEG          15       /* tag further off than this: turn on the spot first */
+#define DRIVE_SPEED_MAX    200      /* forward speed when far away */
+#define DRIVE_SPEED_MIN    60       /* forward speed just outside the tolerance */
+#define SLOW_DOWN_MM       600      /* speed ramps from MIN to MAX over this much extra distance */
+#define REVERSE_SPEED      80       /* backing off when too close */
 #define TURN_MAX_DEG       45
+#define HOLD_TIME_MS       1000     /* in position this long = arrived */
 #define LINK_ON_USART2     0        /* 1 = also send the raw frames on USART2 to the lower board */
 #define TOUCH_DEBUG        1        /* 1 = print every touch (for checking the touch mapping) */
 
@@ -56,6 +71,14 @@ static uint8_t beat_now = 0;
 static int wrong_id = -1;
 static uint8_t reported[(NUM_TAG_IDS + 7) / 8];
 static float bearing = 0, dist_mm = 0;
+static uint32_t t_in_pos = 0;         /* since when the robot has been in position, 0 = not */
+static int settle = 0;                /* frames still to skip after the servo moved */
+
+typedef struct {
+  int speed;                          /* + forward, - backward */
+  int turn;                           /* deg, + = right */
+  char text[64];                      /* readable hint */
+} drive_t;
 static int prev_id[AT_MAX_DETECT], prev_streak[AT_MAX_DETECT], prev_n = 0;
 
 static void print(const char *s)
@@ -113,17 +136,36 @@ static void servo_init(void)
   TIM4->CR1 |= TIM_CR1_CEN;
 }
 
-/* Only the target tag comes here: turn the camera towards it */
-static void pan_update(const at_detection_t *d, int img_w)
+/* Only the target tag comes here.
+   bearing = servo angle + the tag's angle in the image, which is only right
+   when the image was taken at that servo angle. So the servo stays still
+   while the tag is near the centre, jumps straight onto the tag when it
+   drifts out, and the frames taken while it moves are not used for the bearing. */
+static void pan_update(const at_detection_t *d, int img_w, int img_h, int rotation)
 {
   float f = CAM_FOCAL_PX * img_w / 320.0f;
-  float err = atanf((d->cx - img_w / 2.0f) / f) * 57.2958f;   /* deg, + = right of centre */
-  bearing = pan + err;
+  /* pixels right of centre in the upright picture (turned 'rotation' deg clockwise) */
+  float off;
+  switch (rotation) {
+  case 90:  off = img_h / 2.0f - d->cy; break;
+  case 180: off = img_w / 2.0f - d->cx; break;
+  case 270: off = d->cy - img_h / 2.0f; break;
+  default:  off = d->cx - img_w / 2.0f; break;
+  }
+  float err = atanf(off / f) * 57.2958f;                      /* deg, + = right of centre */
   dist_mm = d->side > 0 ? f * TAG_SIZE_MM / d->side : 99999.0f;
-  pan += PAN_GAIN * err;
-  if (pan > PAN_LIMIT_DEG) pan = PAN_LIMIT_DEG;
-  if (pan < -PAN_LIMIT_DEG) pan = -PAN_LIMIT_DEG;
-  servo_write(pan);
+  if (settle > 0) {                   /* image taken while the servo was moving */
+    settle--;
+    return;
+  }
+  bearing = pan + err;
+  if (PAN_SERVO_ENABLED && fabsf(err) > PAN_DEADBAND_DEG) {
+    pan = bearing;
+    if (pan > PAN_LIMIT_DEG) pan = PAN_LIMIT_DEG;
+    if (pan < -PAN_LIMIT_DEG) pan = -PAN_LIMIT_DEG;
+    servo_write(pan);
+    settle = SETTLE_FRAMES;
+  }
 }
 
 /* ---- mission ---- */
@@ -133,6 +175,45 @@ static void print_found(void)
   snprintf(line, sizeof line, "FOUND tag %d bearing %+d deg ~%d mm\r\n",
            target, (int)lroundf(bearing), (int)lroundf(dist_mm));
   print(line);
+}
+
+static int in_position(void)
+{
+  return fabsf(bearing) <= CENTER_TOL_DEG && fabsf(dist_mm - TARGET_DIST_MM) <= DIST_TOL_MM;
+}
+
+/* What the robot should do now. Only meaningful while the target is in view (M_FOUND). */
+static drive_t decide_drive(void)
+{
+  drive_t d = {0, 0, ""};
+  if (mode != M_FOUND) {
+    snprintf(d.text, sizeof d.text, mode == M_SEARCH ? "STOP (searching)" : "STOP (no tag)");
+    return d;
+  }
+  int off = (int)lroundf(bearing);                       /* + = tag is to the right */
+  int err = (int)lroundf(dist_mm) - TARGET_DIST_MM;      /* + = too far */
+  int len = 0;
+
+  if (abs(off) > CENTER_TOL_DEG) {
+    d.turn = off > TURN_MAX_DEG ? TURN_MAX_DEG : (off < -TURN_MAX_DEG ? -TURN_MAX_DEG : off);
+    len += snprintf(d.text + len, sizeof d.text - len, "TURN %s %d deg", off > 0 ? "RIGHT" : "LEFT", abs(off));
+  }
+  if (abs(off) > ALIGN_DEG) {
+    snprintf(d.text + len, sizeof d.text - len, " first");   /* far off to the side: turn on the spot */
+    return d;
+  }
+  if (err > DIST_TOL_MM) {
+    float k = (float)(err - DIST_TOL_MM) / SLOW_DOWN_MM;
+    if (k > 1) k = 1;
+    d.speed = DRIVE_SPEED_MIN + (int)lroundf(k * (DRIVE_SPEED_MAX - DRIVE_SPEED_MIN));
+    snprintf(d.text + len, sizeof d.text - len, "%sMOVE CLOSER %d mm", len ? ", " : "", err);
+  } else if (err < -DIST_TOL_MM) {
+    d.speed = -REVERSE_SPEED;
+    snprintf(d.text + len, sizeof d.text - len, "%sMOVE BACK %d mm", len ? ", " : "", -err);
+  } else if (!len) {
+    snprintf(d.text, sizeof d.text, "HOLD (in position)");
+  }
+  return d;
 }
 
 static void back_to_select(void)
@@ -159,6 +240,7 @@ static void start_mission(int table)
   wrong_id = -1;
   t_wrong_until = 0;
   t_seen = 0;
+  t_in_pos = 0;
   mode = M_SEARCH;
   t_state = HAL_GetTick();
   beat_now = 1;
@@ -171,7 +253,7 @@ static void enter(mission_t m, uint32_t now)
   beat_now = 1;
 }
 
-void delivery_frame(const at_detection_t *dets, int n, int img_w, uint32_t now)
+void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int rotation, uint32_t now)
 {
   if (mode == M_SELECT) return;
 
@@ -192,7 +274,7 @@ void delivery_frame(const at_detection_t *dets, int n, int img_w, uint32_t now)
   for (int i = 0; i < n; i++)
     if (dets[i].id == target && (ti < 0 || dets[i].side > dets[ti].side)) ti = i;
   if (ti >= 0) {
-    pan_update(&dets[ti], img_w);
+    pan_update(&dets[ti], img_w, img_h, rotation);
     t_seen = now;
     if (streak[ti] >= CONFIRM_TAG_FRAMES) {
       if (mode != M_FOUND) {
@@ -200,11 +282,18 @@ void delivery_frame(const at_detection_t *dets, int n, int img_w, uint32_t now)
         t_wrong_until = 0;
         print_found();
       }
-      if (dist_mm <= ARRIVE_MM) {
-        char line[40];
-        snprintf(line, sizeof line, "ARRIVED table %d\r\n", target);
+      /* arrived = centred at the target distance for HOLD_TIME_MS */
+      if (!in_position()) {
+        t_in_pos = 0;
+      } else if (!t_in_pos) {
+        t_in_pos = now;
+      } else if (ELAPSED(now, t_in_pos) >= HOLD_TIME_MS) {
+        char line[64];
+        snprintf(line, sizeof line, "ARRIVED table %d (~%d mm, %+d deg)\r\n",
+                 target, (int)lroundf(dist_mm), (int)lroundf(bearing));
         print(line);
         enter(M_ARRIVED, now);
+        link_send(0, 0);
         return;
       }
     }
@@ -258,10 +347,13 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   case M_SEARCH:
     /* target seen but not confirmed yet: pan_update() holds the camera on it */
     if (t_seen && ELAPSED(now, t_seen) < LOST_MS) break;
-    pan += sweep_dir * (float)SWEEP_DEG_PER_S * dt / 1000.0f;
-    if (pan >= PAN_LIMIT_DEG) { pan = PAN_LIMIT_DEG; sweep_dir = -1; }
-    if (pan <= -PAN_LIMIT_DEG) { pan = -PAN_LIMIT_DEG; sweep_dir = 1; }
-    servo_write(pan);
+    if (PAN_SERVO_ENABLED) {
+      pan += sweep_dir * (float)SWEEP_DEG_PER_S * dt / 1000.0f;
+      if (pan >= PAN_LIMIT_DEG) { pan = PAN_LIMIT_DEG; sweep_dir = -1; }
+      if (pan <= -PAN_LIMIT_DEG) { pan = -PAN_LIMIT_DEG; sweep_dir = 1; }
+      servo_write(pan);
+      settle = SETTLE_FRAMES;         /* frames taken during the sweep give no bearing */
+    }
     if (ELAPSED(now, t_state) > SEARCH_TIMEOUT_MS) {
       snprintf(line, sizeof line, "NOT FOUND table %d\r\n", target);
       print(line);
@@ -269,7 +361,7 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
     }
     break;
   case M_FOUND:
-    if (ELAPSED(now, t_seen) > LOST_MS) enter(M_WAIT, now);
+    if (ELAPSED(now, t_seen) > LOST_MS) { t_in_pos = 0; enter(M_WAIT, now); }
     break;
   case M_WAIT:
     if (ELAPSED(now, t_state) > WAIT_MS) enter(M_SEARCH, now);
@@ -286,7 +378,9 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
 
   /* face */
   int wrong = (int32_t)(t_wrong_until - now) > 0 && (mode == M_SEARCH || mode == M_WAIT);
-  int dx = (int)lroundf(pan * 16.0f / PAN_LIMIT_DEG);
+  /* pupils look where the camera looks; without the servo, at the tag */
+  float look = PAN_SERVO_ENABLED ? pan : (mode == M_FOUND ? bearing * 3 : 0);
+  int dx = (int)lroundf(look * 16.0f / PAN_LIMIT_DEG);
   if (mode == M_ARRIVED) {
     ui_set_eyes(EYES_HAPPY, 0);
     ui_set_status(STATUS_ARRIVED, target);
@@ -308,15 +402,14 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   if (beat_now || now - t_beat >= output_delay) {
     beat_now = 0;
     t_beat = now;
-    if (mode == M_FOUND) {
-      int turn = (int)lroundf(bearing);
-      if (turn > TURN_MAX_DEG) turn = TURN_MAX_DEG;
-      if (turn < -TURN_MAX_DEG) turn = -TURN_MAX_DEG;
-      link_send(fabsf(bearing) > ALIGN_DEG ? 0 : DRIVE_SPEED, turn);
-      print_found();
-    } else {
-      link_send(0, 0);
+    drive_t d = decide_drive();
+    if (mode == M_FOUND) print_found();
+    if (mode != M_ARRIVED && mode != M_NOT_FOUND) {
+      char hint[80];
+      snprintf(hint, sizeof hint, "DRIVE %s\r\n", d.text);
+      print(hint);
     }
+    link_send(d.speed, d.turn);
   }
 }
 
@@ -326,12 +419,12 @@ void delivery_init(void)
   ui_init();
   ui_show_select(0);
   t_poll = HAL_GetTick();
-  print("touch a table on the screen (TABLE / FOUND / INVALID / ARRIVED lines and -> $D commands follow)\r\n");
+  print("touch a table on the screen (TABLE / FOUND / DRIVE / INVALID / ARRIVED lines and -> $D commands follow)\r\n");
 }
 
 const char *delivery_status(void)
 {
-  static char buf[64];
+  static char buf[112];
   uint32_t now = HAL_GetTick();
   switch (mode) {
   case M_SEARCH: {
@@ -340,8 +433,8 @@ const char *delivery_status(void)
     break;
   }
   case M_WAIT:      snprintf(buf, sizeof buf, "WAIT table %d (lost it)", target); break;
-  case M_FOUND:     snprintf(buf, sizeof buf, "FOUND table %d  %+d deg  ~%d mm", target,
-                             (int)lroundf(bearing), (int)lroundf(dist_mm)); break;
+  case M_FOUND:     snprintf(buf, sizeof buf, "FOUND table %d %+d deg ~%d mm | %s", target,
+                             (int)lroundf(bearing), (int)lroundf(dist_mm), decide_drive().text); break;
   case M_ARRIVED:   snprintf(buf, sizeof buf, "ARRIVED table %d", target); break;
   case M_NOT_FOUND: snprintf(buf, sizeof buf, "NOT FOUND table %d", target); break;
   default:          snprintf(buf, sizeof buf, "SELECT a table on the LCD"); break;

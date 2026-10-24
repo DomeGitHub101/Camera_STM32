@@ -76,6 +76,10 @@
 /* ---- camera signal checks ---- */
 #define OV7670_TEST_PATTERN 0       /* 1 = colour bars instead of the picture (key p toggles at run time) */
 #define OV7670_PCLK_DIV    1        /* 1 = normal, 2 / 4 = slower PCLK for long jumper wires (fewer fps) */
+#define CAMERA_ROTATION    270      /* how far to turn the picture clockwise to make it upright: 0 / 90 / 180 / 270.
+                                       The camera is soldered on its side; the sensor cannot turn 90 deg,
+                                       so the left/right angle is taken from the matching image axis and
+                                       the viewer turns the picture (detection works in any orientation) */
 #define CAM_STATS          1        /* 1 = print a CAM: line (frame size / errors) with every result line */
 #define DROP_BAD_FRAMES    1        /* 1 = no tag detection on frames with wrong size or DCMI errors */
 #define FRAME_MARGIN       (4 * OV7670_WIDTH * 2)   /* DMA room for 4 extra lines, to measure long frames */
@@ -540,6 +544,8 @@ static void send_tag_lines(int n)
              (int)d->corners[2][0], (int)d->corners[2][1], (int)d->corners[3][0], (int)d->corners[3][1]);
     uart_print(line);
   }
+  snprintf(line, sizeof line, "@ROT %d\r\n", CAMERA_ROTATION);   /* the viewer turns the picture upright */
+  uart_print(line);
 #if APP_DELIVERY
   snprintf(line, sizeof line, "@CMD %s\r\n", delivery_status());   /* mission state for the viewer */
 #else
@@ -762,7 +768,7 @@ int main(void)
         if (best >= 0) last_best = dets[best];
 #if APP_DELIVERY
         (void)best_cmd;
-        delivery_frame(dets, n, DET_W, HAL_GetTick());
+        delivery_frame(dets, n, DET_W, DET_H, CAMERA_ROTATION, HAL_GetTick());
 #else
         update_command(best_cmd >= 0 ? dets[best_cmd].id : -1, HAL_GetTick());
 #endif

@@ -110,7 +110,10 @@ def draw(view, tags, command, scale_x, scale_y):
     if command:
         text = f"STM32: {command}"
         cv2.rectangle(view, (0, 0), (view.shape[1], 30), (0, 0, 0), -1)
-        cv2.putText(view, text, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 1, cv2.LINE_AA)
+        size = 0.65
+        while size > 0.35 and cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size, 1)[0][0] > view.shape[1] - 16:
+            size -= 0.05                                    # long DRIVE hints: shrink to fit
+        cv2.putText(view, text, (8, 21), cv2.FONT_HERSHEY_SIMPLEX, size, (0, 255, 255), 1, cv2.LINE_AA)
 
 
 # Text mode (APP_DELIVERY firmware, 115200 baud, no video): colour per line type (BGR)
@@ -123,6 +126,7 @@ LINE_COLORS = [
     ("CANCEL", (243, 238, 233)),
     ("->", (230, 200, 90)),          # commands for the lower board
     ("TOUCH", (150, 150, 150)),
+    ("DRIVE", (0, 255, 255)),        # yellow: what the robot should do
 ]
 
 
@@ -159,6 +163,21 @@ def looks_like_text(line):
     return len(line) >= 4 and printable >= 0.9 * len(line)
 
 
+def rotate_upright(image, tags, rotation):
+    """The camera is mounted on its side: turn the picture (and the tag corners,
+    which are fractions of the width / height) clockwise by 'rotation' degrees."""
+    if rotation == 90:
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        tags = [(i, [(1 - y, x) for x, y in pts]) for i, pts in tags]
+    elif rotation == 180:
+        image = cv2.rotate(image, cv2.ROTATE_180)
+        tags = [(i, [(1 - x, 1 - y) for x, y in pts]) for i, pts in tags]
+    elif rotation == 270:
+        image = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        tags = [(i, [(y, 1 - x) for x, y in pts]) for i, pts in tags]
+    return np.ascontiguousarray(image), tags
+
+
 def find_port():
     for p in list_ports.comports():
         text = f"{p.description} {p.manufacturer or ''}".lower()
@@ -193,6 +212,7 @@ def main():
     parser = StreamParser()
     garbage_warned = False
     pending_tags, shown_tags, command = [], [], ""
+    rotation = 0            # @ROT from the STM32: clockwise turn that makes the picture upright
     image = None
     frames = 0
     text_mode = False
@@ -244,6 +264,12 @@ def main():
                             pts = [(int(f[4 + 2 * k]) / det_w, int(f[5 + 2 * k]) / det_h) for k in range(4)]
                             pending_tags.append((tag_id, pts))
                         continue
+                    if line.startswith("@ROT"):
+                        try:
+                            rotation = int(line.split()[1]) % 360
+                        except (IndexError, ValueError):
+                            pass
+                        continue
                     if line.startswith("@CMD"):
                         command = line[5:]
                         continue
@@ -261,11 +287,13 @@ def main():
                     _, w, h, pixels = item
                     image = np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
                     shown_tags, pending_tags = pending_tags, []
+                    image, shown_tags = rotate_upright(image, shown_tags, rotation)
+                    h, w = image.shape
                     frames += 1
                     t_last = time.time()
                     locked = True
 
-                    scale = args.scale or max(1, 640 // w)
+                    scale = args.scale or max(1, min(640 // w, 640 // h))   # upright picture may be tall
                     view = cv2.resize(cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), (w * scale, h * scale),
                                       interpolation=cv2.INTER_NEAREST)
                     draw(view, shown_tags, command, w * scale, h * scale)
