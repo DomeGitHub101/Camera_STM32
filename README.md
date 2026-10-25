@@ -21,6 +21,8 @@ OV7670 ──DCMI+DMA──▶ STM32F767 ──▶ หา AprilTag ──▶ ต
 | สาย jumper ตัวเมีย–ตัวผู้ | ~20 | ยิ่งสั้นยิ่งดี |
 | ตัวเก็บประจุ ceramic 100–470 pF | 1 | *ไม่บังคับ* กรอง glitch ที่ VSYNC |
 | สาย USB (Micro-B) | 1 | เสียบช่อง ST-LINK (CN1) |
+| จอ 2.8" TFT SPI 240×320 V1.2 (ILI9341 + ทัช XPT2046) | 1 | หน้าเลือกโต๊ะ / หน้าแมว (โหมด `APP_DELIVERY`) |
+| Servo (SG90 หรือเทียบเท่า) | 1 | หมุนกล้องซ้าย-ขวา (pan) — ใช้ไฟ 5V แยก |
 
 ---
 
@@ -85,6 +87,55 @@ SIOC ──────────────┴── PF1
 |---|---|
 | PD8 / PD9 | USART3 TX/RX → ST-LINK Virtual COM Port |
 | PA13 / PA14 | SWD (debug/flash ผ่าน ST-LINK) |
+
+### 2.5 จอ LCD ILI9341 2.8" + ทัช XPT2046 → NUCLEO-F767ZI
+
+ขาและไลบรารีตามเอกสารวิชา Lec11 (ไลบรารี `ILI9341_STM32_Driver`, `ILI9341_GFX`, `ILI9341_Touchscreen`)
+จอใช้ SPI5 (Full-Duplex Master, 8 bit, CPOL Low, CPHA 1 Edge, prescaler 4) ส่วนทัชอ่านแบบ bit-bang
+
+| ขาบนโมดูลจอ | ขา STM32 | ตำแหน่งบนบอร์ด | หน้าที่ |
+|---|---|---|---|
+| **VCC** | +3V3 หรือ +5V | เช่น CN8 ขา 7 (3V3) | ไฟเลี้ยง — โมดูล V1.2 มี regulator รับได้ทั้งสองแบบ (สัญญาณเป็น 3.3V) |
+| **GND** | GND | เช่น CN9 ขา 12 | กราวด์ |
+| **CS** | **PC8** | CN8 ขา 2 | LCD chip select |
+| **RESET** | **PC10** | CN8 ขา 6 | LCD reset |
+| **DC** (D/C, RS) | **PC12** | CN8 ขา 10 | data / command — **ไม่ใช่ PC9** (PC9 = DCMI_D3 ของกล้อง) |
+| **SDI** (MOSI) | **PF9** | CN9 ขา 28 | SPI5_MOSI |
+| **SCK** | **PF7** | CN9 ขา 26 | SPI5_SCK |
+| **LED** | +3V3 | ร่วมกับ VCC | ไฟพื้นหลัง (ต่อค้างไว้) |
+| **SDO** (MISO) | **PF8** | CN9 ขา 24 | SPI5_MISO |
+| **T_CLK** | **PE3** | CN9 ขา 22 | ทัช clock (bit-bang) |
+| **T_CS** | **PE6** | CN9 ขา 20 | ทัช chip select |
+| **T_DIN** | **PE5** | CN9 ขา 18 | ทัช data in (MOSI) |
+| **T_DO** | **PE4** | CN9 ขา 16 | ทัช data out (MISO) |
+| **T_IRQ** | **PE2** | CN9 ขา 14 | แตะจอ = LOW → EXTI2 (falling, pull-up) |
+
+- จอวางแนวนอน 320×240 (`ILI9341_Set_Rotation(SCREEN_HORIZONTAL_1)`)
+- ภาพบนจอเพี้ยน → เพิ่ม prescaler ของ SPI5 (ช้าลง) ใน CubeMX
+- แตะแล้วตำแหน่งไม่ตรง → ปรับ `TP_ADC_X_LEFT/RIGHT`, `TP_ADC_Y_TOP/BOTTOM` ใน `Core/Src/cat_ui.c`
+  (บรรทัด `TOUCH x=.. y=.. (adc a,b)` ใน Tera Term บอกค่าที่อ่านได้)
+
+### 2.6 Servo หมุนกล้อง (pan)
+
+| ขา servo | ต่อกับ | หมายเหตุ |
+|---|---|---|
+| สัญญาณ (ส้ม/เหลือง) | **PD14** (CN7 ขา 16) | TIM4_CH3, 50 Hz, 500–2500 µs = −90°..+90° |
+| V+ (แดง) | **5V จากแหล่งจ่ายแยก** | อย่าดึงไฟจากบอร์ด — servo กระชากกระแสจน ST-LINK หลุด |
+| GND (น้ำตาล/ดำ) | GND แหล่งจ่าย **และ** GND บอร์ด | ต้องต่อกราวด์ร่วม |
+
+ยังไม่ต่อ servo ให้ตั้ง `PAN_SERVO_ENABLED 0` ใน `Core/Src/delivery.c` (กล้องมองตรงไปข้างหน้า ไม่กวาด)
+หมุนผิดทาง → `PAN_SERVO_DIR -1`
+
+### 2.7 บอร์ดล่าง (มอเตอร์ + ToF) — USART2
+
+| สัญญาณ | บอร์ดบน | บอร์ดล่าง |
+|---|---|---|
+| UART บน → ล่าง | PD5 (USART2_TX, CN9 ขา 6) | PD6 (USART2_RX) |
+| UART ล่าง → บน | PD6 (USART2_RX, CN9 ขา 4) | PD5 (USART2_TX) |
+| GND | GND | GND (ต่อร่วม) |
+
+115200 8N1 · บน → ล่าง `$M,left,right,mode*XX` ทุก 100 ms · ล่าง → บน `$O,level,dist_mm*XX` ทุก 200 ms
+(checksum = XOR ทุกตัวอักษรระหว่าง `$` กับ `*`) — ยังไม่ได้เปิด USART2 ในเฟิร์มแวร์ตัวนี้
 
 ---
 
