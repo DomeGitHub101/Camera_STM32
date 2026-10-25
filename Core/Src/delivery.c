@@ -12,6 +12,10 @@
  * TURN LEFT / TURN RIGHT / HOLD). Without the wheel board the hints are only
  * printed; the same {speed, turn} goes to link_send() for the lower board.
  * In position (centred and at TARGET_DIST_MM) for HOLD_TIME_MS = arrived.
+ *
+ * Going back: at the table the customer touches "รับอาหารแล้ว" (or
+ * RECEIVE_TIMEOUT_MS passes); the robot then looks for the start-point tag
+ * HOME_TAG_ID and drives to it with the same search / drive logic.
  */
 #include "delivery.h"
 #include "cat_ui.h"
@@ -27,7 +31,9 @@
 #define CAM_FOCAL_PX       418.0f   /* at 320 px image width; calibrated: 30 cm read 172 mm with 100 mm / 340 px.
                                        re-calibrate: new = old * real / printed distance */
 #define CONFIRM_TAG_FRAMES 3        /* same tag in this many frames in a row before it counts */
-#define ARRIVED_SHOW_MS    5000
+#define HOME_TAG_ID        0        /* tag at the start point (kitchen): the robot drives back to it */
+#define RECEIVE_TIMEOUT_MS 10000    /* at the table: go back after this long without "รับอาหารแล้ว" (0 = wait) */
+#define HOME_SHOW_MS       3000     /* "ถึงจุดเริ่มต้นแล้ว" shown this long, then the table page */
 #define NOT_FOUND_SHOW_MS  2500
 #define WRONG_SHOW_MS      1600     /* red eyes + text after a wrong tag */
 #define LOST_MS            700      /* target out of view this long -> stop and wait (orange) */
@@ -73,6 +79,7 @@ static uint8_t reported[(NUM_TAG_IDS + 7) / 8];
 static float bearing = 0, dist_mm = 0;
 static uint32_t t_in_pos = 0;         /* since when the robot has been in position, 0 = not */
 static int settle = 0;                /* frames still to skip after the servo moved */
+static uint8_t returning = 0;         /* 1 = on the way back to HOME_TAG_ID */
 
 typedef struct {
   int speed;                          /* + forward, - backward */
@@ -225,15 +232,17 @@ static void back_to_select(void)
   ui_show_select(selected);
 }
 
-static void start_mission(int table)
+/* what the robot is heading for, for the result lines */
+static const char *goal(void)
 {
-  char line[40];
-  selected = target = table;
-  snprintf(line, sizeof line, "TABLE %d selected\r\n", table);
-  print(line);
-  ui_show_select(table);              /* the touched button turns orange */
-  HAL_Delay(150);
-  ui_show_mission(table);
+  static char buf[24];
+  if (returning) snprintf(buf, sizeof buf, "home (tag %d)", HOME_TAG_ID);
+  else snprintf(buf, sizeof buf, "table %d", target);
+  return buf;
+}
+
+static void reset_search(void)
+{
   memset(reported, 0, sizeof reported);
   prev_n = 0;
   sweep_dir = 1;
@@ -244,6 +253,31 @@ static void start_mission(int table)
   mode = M_SEARCH;
   t_state = HAL_GetTick();
   beat_now = 1;
+}
+
+/* food taken (or timeout): drive back to the start-point tag */
+static void start_return(void)
+{
+  char line[48];
+  returning = 1;
+  target = HOME_TAG_ID;
+  snprintf(line, sizeof line, "RETURN to home (tag %d)\r\n", HOME_TAG_ID);
+  print(line);
+  ui_show_mission(HOME_TAG_ID);
+  reset_search();
+}
+
+static void start_mission(int table)
+{
+  char line[40];
+  selected = target = table;
+  snprintf(line, sizeof line, "TABLE %d selected\r\n", table);
+  print(line);
+  ui_show_select(table);              /* the touched button turns orange */
+  HAL_Delay(150);
+  ui_show_mission(table);
+  returning = 0;
+  reset_search();
 }
 
 static void enter(mission_t m, uint32_t now)
@@ -289,18 +323,20 @@ void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int
         t_in_pos = now;
       } else if (ELAPSED(now, t_in_pos) >= HOLD_TIME_MS) {
         char line[64];
-        snprintf(line, sizeof line, "ARRIVED table %d (~%d mm, %+d deg)\r\n",
-                 target, (int)lroundf(dist_mm), (int)lroundf(bearing));
+        snprintf(line, sizeof line, "ARRIVED %s (~%d mm, %+d deg)\r\n",
+                 goal(), (int)lroundf(dist_mm), (int)lroundf(bearing));
         print(line);
         enter(M_ARRIVED, now);
         link_send(0, 0);
+        if (!returning) ui_show_received(1);   /* the customer confirms with this button */
         return;
       }
     }
   }
 
-  /* wrong tags: once per tag per mission, not while following the target */
-  if (mode == M_FOUND) return;
+  /* wrong tags: once per tag per mission, not while following the target,
+     and not on the way back (the tables are expected to be seen then) */
+  if (mode == M_FOUND || returning) return;
   for (int i = 0; i < n; i++) {
     int id = dets[i].id;
     if (id == target || streak[i] < CONFIRM_TAG_FRAMES || id < 0 || id >= NUM_TAG_IDS) continue;
@@ -321,17 +357,21 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   if (dt > 200) dt = 200;
 
   /* touch */
+  char line[64];
   int x, y;
   if (ui_poll_touch(&x, &y)) {
 #if TOUCH_DEBUG
     extern uint16_t ui_touch_raw[2];
-    char line[64];
     snprintf(line, sizeof line, "TOUCH x=%d y=%d (adc %u,%u)\r\n", x, y, ui_touch_raw[0], ui_touch_raw[1]);
     print(line);
 #endif
     if (mode == M_SELECT) {
       int t = ui_hit_table(x, y);
       if (t) start_mission(t);
+    } else if (mode == M_ARRIVED && !returning && ui_hit_received(x, y)) {
+      snprintf(line, sizeof line, "RECEIVED table %d\r\n", target);
+      print(line);
+      start_return();
     } else if (ui_hit_cancel(x, y)) {
       print("CANCEL\r\n");
       back_to_select();
@@ -342,7 +382,6 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   now = HAL_GetTick();
   t_poll = now;
 
-  char line[48];
   switch (mode) {
   case M_SEARCH:
     /* target seen but not confirmed yet: pan_update() holds the camera on it */
@@ -355,9 +394,10 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
       settle = SETTLE_FRAMES;         /* frames taken during the sweep give no bearing */
     }
     if (ELAPSED(now, t_state) > SEARCH_TIMEOUT_MS) {
-      snprintf(line, sizeof line, "NOT FOUND table %d\r\n", target);
+      snprintf(line, sizeof line, "NOT FOUND %s%s\r\n", goal(), returning ? ", searching again" : "");
       print(line);
-      enter(M_NOT_FOUND, now);
+      if (returning) t_state = now;   /* never give up on the way back (cancel stops it) */
+      else enter(M_NOT_FOUND, now);
     }
     break;
   case M_FOUND:
@@ -367,7 +407,14 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
     if (ELAPSED(now, t_state) > WAIT_MS) enter(M_SEARCH, now);
     break;
   case M_ARRIVED:
-    if (ELAPSED(now, t_state) > ARRIVED_SHOW_MS) { back_to_select(); return; }
+    if (returning) {
+      if (ELAPSED(now, t_state) > HOME_SHOW_MS) { back_to_select(); return; }
+    } else if (RECEIVE_TIMEOUT_MS && ELAPSED(now, t_state) > RECEIVE_TIMEOUT_MS) {
+      snprintf(line, sizeof line, "RECEIVE TIMEOUT table %d\r\n", target);
+      print(line);
+      start_return();
+      return;
+    }
     break;
   case M_NOT_FOUND:
     if (ELAPSED(now, t_state) > NOT_FOUND_SHOW_MS) { back_to_select(); return; }
@@ -383,7 +430,10 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   int dx = (int)lroundf(look * 16.0f / PAN_LIMIT_DEG);
   if (mode == M_ARRIVED) {
     ui_set_eyes(EYES_HAPPY, 0);
-    ui_set_status(STATUS_ARRIVED, target);
+    ui_set_status(returning ? STATUS_HOME : STATUS_ARRIVED, target);
+  } else if (returning) {
+    ui_set_eyes(mode == M_FOUND ? EYES_FOUND : (mode == M_WAIT ? EYES_WAIT : EYES_SEARCH), dx);
+    ui_set_status(STATUS_GOING_HOME, 0);
   } else if (mode == M_NOT_FOUND) {
     ui_set_eyes(EYES_WAIT, dx);
     ui_set_status(STATUS_NOT_FOUND, target);
@@ -419,7 +469,7 @@ void delivery_init(void)
   ui_init();
   ui_show_select(0);
   t_poll = HAL_GetTick();
-  print("touch a table on the screen (TABLE / FOUND / DRIVE / INVALID / ARRIVED lines and -> $D commands follow)\r\n");
+  print("touch a table on the screen (TABLE / FOUND / DRIVE / INVALID / ARRIVED / RECEIVED / RETURN lines and -> $D commands follow)\r\n");
 }
 
 const char *delivery_status(void)
@@ -429,14 +479,18 @@ const char *delivery_status(void)
   switch (mode) {
   case M_SEARCH: {
     int left = (SEARCH_TIMEOUT_MS - ELAPSED(now, t_state) + 999) / 1000;
-    snprintf(buf, sizeof buf, "SEARCH table %d  %d s left  pan %+d", target, left < 0 ? 0 : left, (int)lroundf(pan));
+    snprintf(buf, sizeof buf, "SEARCH %s  %d s left  pan %+d", goal(), left < 0 ? 0 : left, (int)lroundf(pan));
     break;
   }
-  case M_WAIT:      snprintf(buf, sizeof buf, "WAIT table %d (lost it)", target); break;
-  case M_FOUND:     snprintf(buf, sizeof buf, "FOUND table %d %+d deg ~%d mm | %s", target,
+  case M_WAIT:      snprintf(buf, sizeof buf, "WAIT %s (lost it)", goal()); break;
+  case M_FOUND:     snprintf(buf, sizeof buf, "FOUND %s %+d deg ~%d mm | %s", goal(),
                              (int)lroundf(bearing), (int)lroundf(dist_mm), decide_drive().text); break;
-  case M_ARRIVED:   snprintf(buf, sizeof buf, "ARRIVED table %d", target); break;
-  case M_NOT_FOUND: snprintf(buf, sizeof buf, "NOT FOUND table %d", target); break;
+  case M_ARRIVED:
+    if (returning) snprintf(buf, sizeof buf, "ARRIVED home");
+    else snprintf(buf, sizeof buf, "ARRIVED table %d  touch the button (or wait %d s)", target,
+                  RECEIVE_TIMEOUT_MS / 1000);
+    break;
+  case M_NOT_FOUND: snprintf(buf, sizeof buf, "NOT FOUND %s", goal()); break;
   default:          snprintf(buf, sizeof buf, "SELECT a table on the LCD"); break;
   }
   return buf;

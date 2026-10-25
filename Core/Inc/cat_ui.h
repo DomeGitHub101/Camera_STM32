@@ -28,6 +28,8 @@ typedef enum {
   STATUS_FOUND,       /* เจอโต๊ะ N แล้ว! */
   STATUS_ARRIVED,     /* ถึงโต๊ะ N แล้ว · รับอาหารได้เลย */
   STATUS_NOT_FOUND,   /* ไม่พบโต๊ะ N */
+  STATUS_GOING_HOME,  /* กำลังกลับจุดเริ่มต้น */
+  STATUS_HOME,        /* ถึงจุดเริ่มต้นแล้ว */
 } ui_status_t;
 
 extern volatile uint32_t ui_touch_irq_count;   /* T_IRQ falling edges (EXTI2) */
@@ -46,5 +48,8 @@ void ui_set_status(ui_status_t status, int n);
 int ui_poll_touch(int *x, int *y);
 int ui_hit_table(int x, int y);    /* page 1: 1..6, 0 = no button */
 int ui_hit_cancel(int x, int y);   /* page 2: 1 = cancel button */
+/* page 2 at the table: "รับอาหารแล้ว" button (1 = draw, 0 = erase) */
+void ui_show_received(int show);
+int ui_hit_received(int x, int y); /* 1 = "รับอาหารแล้ว" touched (only while it is shown) */
 
 #endif /* CAT_UI_H */

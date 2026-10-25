@@ -18,6 +18,9 @@ extern const mono_bmp_t TXT_FOUND_DONE;    /* แล้ว!  (36x24) */
 extern const mono_bmp_t TXT_ARRIVED;       /* ถึงโต๊ะ  (46x24) */
 extern const mono_bmp_t TXT_ARRIVED_DONE;  /* แล้ว · รับอาหารได้เลย  (161x24) */
 extern const mono_bmp_t TXT_NOT_FOUND;     /* ไม่พบโต๊ะ  (72x24) */
+extern const mono_bmp_t TXT_GOING_HOME;    /* กำลังกลับจุดเริ่มต้น  (143x24) */
+extern const mono_bmp_t TXT_HOME_ARRIVED;  /* ถึงจุดเริ่มต้นแล้ว  (119x24) */
+extern const mono_bmp_t TXT_RECEIVED;      /* รับอาหารแล้ว  (99x24) */
 extern const mono_bmp_t TXT_CANCEL;        /* ยกเลิก  (35x14) */
 extern const mono_bmp_t TXT_TAG_FAMILY;    /* · tag36h11  (66x14) */
 

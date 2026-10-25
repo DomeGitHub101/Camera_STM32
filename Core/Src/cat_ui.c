@@ -52,6 +52,10 @@
 #define CANCEL_H      26
 #define CANCEL_X      (SCR_W - 6 - CANCEL_W)
 #define CANCEL_Y      (SCR_H - 6 - CANCEL_H)
+#define RECV_W        120             /* "รับอาหารแล้ว" button, bottom middle, at the table */
+#define RECV_H        32
+#define RECV_X        106
+#define RECV_Y        (SCR_H - 6 - RECV_H)
 
 /* ---- touch: raw XPT2046 readings mapped to the landscape screen ----
    Not TP_Read_Coordinates(): its fixed portrait formula wraps around near the
@@ -230,6 +234,7 @@ int ui_hit_table(int x, int y)
 /* ---- page 2 ---- */
 static int cur_eyes = -1, cur_dx = 0;
 static int cur_status = -1, cur_status_n = -1;
+static int received_shown = 0;        /* "รับอาหารแล้ว" button on screen */
 
 static void draw_eye(int cx, ui_eyes_t eyes, int dx)
 {
@@ -290,10 +295,17 @@ void ui_set_status(ui_status_t status, int n)
     line_bmp(&l, &TXT_NOT_FOUND);
     colour = C_ORANGE;
     break;
+  case STATUS_GOING_HOME:
+    line_bmp(&l, &TXT_GOING_HOME);
+    break;
+  case STATUS_HOME:
+    line_bmp(&l, &TXT_HOME_ARRIVED);
+    colour = C_GREEN;
+    break;
   default:
     break;
   }
-  if (status != STATUS_NONE) {
+  if (status != STATUS_NONE && status != STATUS_GOING_HOME && status != STATUS_HOME) {
     line_str(&l, &FONT_STATUS, " ");
     line_num(&l, &FONT_STATUS, n);
   }
@@ -309,6 +321,7 @@ void ui_show_mission(int table)
   ILI9341_Fill_Screen(C_BG);
   cur_eyes = -1;
   cur_status = -1;
+  received_shown = 0;
 
   /* bottom left: ID N · tag36h11 */
   line_t l = {0};
@@ -331,6 +344,22 @@ int ui_hit_cancel(int x, int y)
 {
   /* a little bigger than the button: it is small */
   return x >= CANCEL_X - 8 && y >= CANCEL_Y - 8;
+}
+
+void ui_show_received(int show)
+{
+  cv_begin(RECV_W, RECV_H, C_BG);
+  if (show) {
+    cv_rrect(0, 0, RECV_W, RECV_H, 10, C_SELECTED);
+    cv_mono(&TXT_RECEIVED, (RECV_W - TXT_RECEIVED.w) / 2, (RECV_H - TXT_RECEIVED.h) / 2, C_TEXT);
+  }
+  cv_send(RECV_X, RECV_Y);
+  received_shown = show;
+}
+
+int ui_hit_received(int x, int y)
+{
+  return received_shown && x >= RECV_X && x < RECV_X + RECV_W && y >= RECV_Y - 8;
 }
 
 /* ---- touch: EXTI2_IRQHandler (stm32f7xx_it.c, CubeMX) calls this ---- */
