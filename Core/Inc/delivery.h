@@ -20,7 +20,12 @@ void delivery_poll(uint32_t now, uint32_t output_delay);
 /* one-line mission state, e.g. "SEARCH table 3  9 s left", for the PC viewer */
 const char *delivery_status(void);
 
-/* every command for the lower board goes through here: "$D,speed,turn*XX" */
-void link_send(int speed, int turn);
+/* start sending $M,0,0,0 to the lower board every 100 ms (TIM6 interrupt);
+   call right after the USART2 init, before the slow camera / LCD set-up */
+void link_start(void);
+/* every command for the lower board goes through here: "$M,left,right,mode*XX" on USART2
+   (left / right = wheel %, -100..100; mode 0 = stop, 1 = drive, 2 = docking).
+   It sets the newest command; the TIM6 interrupt sends it every 100 ms. */
+void link_send(int left, int right, int mode);
 
 #endif /* DELIVERY_H */

@@ -13,6 +13,12 @@
 
 #define UI_TABLES  6
 
+/* 0 = nothing is sent to the LCD (no SPI traffic at all): for testing whether
+   the LCD disturbs the camera picture. Touch and the mission still run. */
+#ifndef LCD_ENABLE
+#define LCD_ENABLE 1
+#endif
+
 typedef enum {
   EYES_SEARCH,     /* yellow: looking for the table */
   EYES_FOUND,      /* green: target tag in view */
@@ -30,6 +36,8 @@ typedef enum {
   STATUS_NOT_FOUND,   /* ไม่พบโต๊ะ N */
   STATUS_GOING_HOME,  /* กำลังกลับจุดเริ่มต้น */
   STATUS_HOME,        /* ถึงจุดเริ่มต้นแล้ว */
+  STATUS_OBSTACLE,    /* กรุณาหลบหน่อยครับ (lower board's ToF) */
+  STATUS_LINK_LOST,   /* บอร์ดล่างไม่ตอบ */
 } ui_status_t;
 
 extern volatile uint32_t ui_touch_irq_count;   /* T_IRQ falling edges (EXTI2) */

@@ -35,6 +35,7 @@
 #include <string.h>
 #include "tim.h"
 #include "delivery.h"
+#include "cat_ui.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -617,7 +618,14 @@ int main(void)
   MX_I2C2_Init();
   MX_TIM2_Init();
   MX_SPI5_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+#if APP_DELIVERY
+  /* $M,0,0,0 to the lower board every 100 ms from now on (TIM6 interrupt):
+     it keeps coming while the camera + LCD set-up below takes a few seconds,
+     and a valid $M cancels the lower board's start-up wheel test */
+  link_start();
+#endif
   huart3.Init.BaudRate = UART_BAUD;   /* 115200 is too slow for the video to the viewer */
   HAL_UART_Init(&huart3);
   char msg[96];
@@ -633,8 +641,24 @@ int main(void)
 #if BOOT_DIAG
   snprintf(msg, sizeof msg, "  SCCB idle levels: SCL=%d SDA=%d (expect 1 1)\r\n", SCL_IN(), SDA_IN());
   uart_print(msg);
+  /* can the board pull each line low and let it go again? (damaged pin / short) */
+  {
+    int scl_lo, scl_hi, sda_lo, sda_hi;
+    SCL_L(); bb_delay(); scl_lo = SCL_IN(); SCL_H(); bb_delay(); bb_delay(); scl_hi = SCL_IN();
+    SDA_L(); bb_delay(); sda_lo = SDA_IN(); SDA_H(); bb_delay(); bb_delay(); sda_hi = SDA_IN();
+    snprintf(msg, sizeof msg, "  drive test: SCL low=%d high=%d  SDA low=%d high=%d (expect 0 1 0 1)\r\n",
+             scl_lo, scl_hi, sda_lo, sda_hi);
+    uart_print(msg);
+  }
   bb_read_reg(0x0A, msg, sizeof msg); uart_print(msg);
   bb_read_reg(0x0B, msg, sizeof msg); uart_print(msg);
+  /* a powered camera with XCLK runs its default video at once, before any SCCB set-up */
+  snprintf(msg, sizeof msg, "  edges in 200 ms before set-up: PCLK=%lu HREF=%lu VSYNC=%lu XCLK(PA5)=%lu\r\n",
+           (unsigned long)count_edges(GPIOA, GPIO_PIN_6, 200),
+           (unsigned long)count_edges(GPIOA, GPIO_PIN_4, 200),
+           (unsigned long)count_edges(GPIOG, GPIO_PIN_9, 200),
+           (unsigned long)count_edges(GPIOA, GPIO_PIN_5, 200));
+  uart_print(msg);
 #endif
   MX_I2C2_Init();
 
@@ -794,7 +818,20 @@ int main(void)
 #if APP_DELIVERY
     /* touch, servo, face, and the TABLE / FOUND / -> $D lines every output_delay */
     delivery_poll(HAL_GetTick(), output_delay);
+#if CAM_STATS
+    /* frame checks (size / lines / errors) also in this mode, for chasing bad pictures */
+    if (HAL_GetTick() - t_out >= output_delay) {
+      char fl[48];
+      uint32_t dt = HAL_GetTick() - t_out;
+      snprintf(fl, sizeof fl, "  fps %lu.%lu, LCD %s\r\n", (unsigned long)(cam.frames * 1000u / dt),
+               (unsigned long)(cam.frames * 10000u / dt % 10), LCD_ENABLE ? "on" : "off");
+      t_out = HAL_GetTick();
+      print_cam_stats();
+      uart_print(fl);
+    }
+#else
     (void)t_out;
+#endif
 #else
     if (HAL_GetTick() - t_out >= output_delay) {
       t_out = HAL_GetTick();

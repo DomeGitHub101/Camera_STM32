@@ -118,9 +118,11 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN TIM2_MspPostInit 1 */
-    /* XCLK 13.5 MHz for the camera needs fast edges (kept here so a CubeMX
-       regeneration that forgets PA5 Speed = Very High does not break the camera) */
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    /* XCLK 13.5 MHz: Medium is enough for it, and the softer edges stop it
+       coupling into the PCLK wire next to it (with Very High every frame got
+       extra PCLK edges: "long" frames, Y/U byte slips). Kept here so a CubeMX
+       regeneration (which sets Low) does not change it. */
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   /* USER CODE END TIM2_MspPostInit 1 */
   }

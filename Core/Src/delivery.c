@@ -7,11 +7,17 @@
  * target tag drives the servo, so it never locks on a wrong tag. Wrong tags
  * are reported once per tag per mission.
  *
- * Driving: decide_drive() turns the target's bearing and distance into one
- * command {speed, turn} plus a readable hint (MOVE CLOSER / MOVE BACK /
- * TURN LEFT / TURN RIGHT / HOLD). Without the wheel board the hints are only
- * printed; the same {speed, turn} goes to link_send() for the lower board.
- * In position (centred and at TARGET_DIST_MM) for HOLD_TIME_MS = arrived.
+ * Driving: decide_drive() turns the target's bearing and distance into
+ * left / right wheel percentages plus a readable hint (MOVE CLOSER / MOVE
+ * BACK / TURN LEFT / TURN RIGHT / HOLD). In position (centred and at
+ * TARGET_DIST_MM) for HOLD_TIME_MS = arrived.
+ *
+ * Lower board (motors + ToF) on USART2, 115200 (README section 2.7):
+ *   -> $M,left,right,mode*XX   every LINK_PERIOD_MS (its motor watchdog stops
+ *                              the wheels after 500 ms without one)
+ *   <- $O,level,dist_mm*XX     ToF obstacle level 0..3; level >= 2 pauses the
+ *                              mission and shows "กรุณาหลบหน่อยครับ"
+ * Tera Term shows the same frames ("-> $M...") every output_delay.
  *
  * Going back: at the table the customer touches "รับอาหารแล้ว" (or
  * RECEIVE_TIMEOUT_MS passes); the robot then looks for the start-point tag
@@ -53,13 +59,24 @@
 #define DIST_TOL_MM        100      /* +- this is close enough */
 #define CENTER_TOL_DEG     5        /* tag within +- this of straight ahead is centred */
 #define ALIGN_DEG          15       /* tag further off than this: turn on the spot first */
-#define DRIVE_SPEED_MAX    200      /* forward speed when far away */
-#define DRIVE_SPEED_MIN    60       /* forward speed just outside the tolerance */
-#define SLOW_DOWN_MM       600      /* speed ramps from MIN to MAX over this much extra distance */
-#define REVERSE_SPEED      80       /* backing off when too close */
-#define TURN_MAX_DEG       45
 #define HOLD_TIME_MS       1000     /* in position this long = arrived */
-#define LINK_ON_USART2     0        /* 1 = also send the raw frames on USART2 to the lower board */
+/* ---- wheel commands, % of full PWM (lower board: motor_set(left, right)) ---- */
+#define WHEEL_FWD_MAX      40       /* forward when far away (start low, raise after floor tests) */
+#define WHEEL_FWD_MIN      20       /* forward just outside the distance tolerance */
+#define SLOW_DOWN_MM       600      /* forward ramps from MIN to MAX over this much extra distance */
+#define WHEEL_REVERSE      25       /* backing off when too close */
+#define WHEEL_SPIN         30       /* turning on the spot: one side +, the other - */
+#define WHEEL_PCT_PER_DEG  1        /* steering while driving: wheel difference per degree off centre */
+#define WHEEL_STEER_MAX    15
+#define DOCK_ZONE_MM       300      /* closer than TARGET_DIST_MM + this: mode 2 (docking, ToF stays quiet) */
+/* ---- link to the lower board (USART2) ---- */
+#define LINK_PERIOD_MS     100      /* $M rate (TIM6 interrupt); the lower board stops after 500 ms without one */
+#define LINK_STALE_MS      400      /* main loop silent this long: the interrupt sends stop */
+#define LINK_RX_TIMEOUT_MS 1000     /* no $O this long (after the first one) = lower board lost */
+#define LINK_DEBUG         1        /* 1 = print a LINK TX/RX line every output_delay (counts + last HAL status) */
+#define LINK_MODE_STOP     0
+#define LINK_MODE_DRIVE    1
+#define LINK_MODE_DOCKING  2
 #define TOUCH_DEBUG        1        /* 1 = print every touch (for checking the touch mapping) */
 
 #define NUM_TAG_IDS        587      /* tag36h11 */
@@ -82,10 +99,25 @@ static int settle = 0;                /* frames still to skip after the servo mo
 static uint8_t returning = 0;         /* 1 = on the way back to HOME_TAG_ID */
 
 typedef struct {
-  int speed;                          /* + forward, - backward */
-  int turn;                           /* deg, + = right */
+  int left, right;                    /* wheel %, -100..100, + = forward */
+  int link_mode;                      /* LINK_MODE_* */
   char text[64];                      /* readable hint */
 } drive_t;
+
+/* lower board link */
+static uint8_t link_now = 0;          /* send $M at once (state changed) */
+
+static char last_frame[40] = "";      /* last $M sent, echoed to Tera Term */
+static volatile uint8_t rx_ring[128];
+static volatile uint16_t rx_head = 0;
+static uint16_t rx_tail = 0;
+static uint8_t rx_byte;
+static char rx_line[48];
+static int rx_len = 0;
+static uint8_t obst_seen = 0;         /* a $O has arrived at least once */
+static uint8_t link_lost = 0;
+static int obst_level = 0, obst_dist = 0;
+static uint32_t t_obst_rx = 0;
 static int prev_id[AT_MAX_DETECT], prev_streak[AT_MAX_DETECT], prev_n = 0;
 
 static void print(const char *s)
@@ -93,19 +125,158 @@ static void print(const char *s)
   HAL_UART_Transmit(&huart3, (uint8_t *)s, strlen(s), 100);
 }
 
-/* ---- link to the lower board ---- */
-void link_send(int speed, int turn)
+/* ---- link to the lower board (USART2) ---- */
+static uint8_t xor_sum(const char *p, const char *end)
 {
-  char body[32], line[48];
-  snprintf(body, sizeof body, "D,%d,%d", speed, turn);
   uint8_t sum = 0;
-  for (const char *p = body; *p; p++) sum ^= (uint8_t)*p;   /* XOR of everything between $ and * */
-  snprintf(line, sizeof line, "-> $%s*%02X\r\n", body, sum);
+  for (; p < end && *p; p++) sum ^= (uint8_t)*p;          /* everything between $ and * */
+  return sum;
+}
+
+static int clamp_pct(int v)
+{
+  return v > 100 ? 100 : (v < -100 ? -100 : v);
+}
+
+/* The $M frames go out from the TIM6 interrupt every LINK_PERIOD_MS, from
+   boot on, whatever the main loop is doing (camera set-up, LCD redraws).
+   The main loop only sets the newest command. If it stops doing so for
+   LINK_STALE_MS (stuck somewhere), the interrupt sends "stop" instead, so a
+   hung main loop never keeps the wheels turning. */
+static char frame_cur[44] = "$M,0,0,0*51\r\n";   /* newest frame, set by link_send() */
+static char frame_tx[44];                         /* the copy being sent */
+static volatile uint32_t t_cmd = 0;               /* when the main loop last set a command */
+
+void link_send(int left, int right, int mode)
+{
+  char body[32], line[44];
+  snprintf(body, sizeof body, "M,%d,%d,%d", clamp_pct(left), clamp_pct(right), mode);
+  snprintf(last_frame, sizeof last_frame, "$%s*%02X", body, xor_sum(body, body + strlen(body)));
+  snprintf(line, sizeof line, "%s\r\n", last_frame);
+  uint32_t primask = __get_PRIMASK();
+  __disable_irq();
+  strcpy(frame_cur, line);
+  t_cmd = HAL_GetTick();
+  __set_PRIMASK(primask);
+}
+
+/* link diagnostics: what the TIM6 sender did, what came back */
+static volatile uint32_t dbg_ticks, dbg_ok, dbg_busy, dbg_err, dbg_done, dbg_rx_bytes, dbg_rx_ok, dbg_rx_bad;
+static volatile HAL_StatusTypeDef dbg_last = HAL_OK;
+static volatile uint32_t dbg_gstate;
+
+void TIM6_DAC_IRQHandler(void)
+{
+  if (!(TIM6->SR & TIM_SR_UIF)) return;
+  TIM6->SR = ~TIM_SR_UIF;
+  dbg_ticks++;
+  dbg_gstate = huart2.gState;
+  if (huart2.gState != HAL_UART_STATE_READY) { dbg_busy++; return; }   /* last frame still going out */
+  const char *f = HAL_GetTick() - t_cmd > LINK_STALE_MS ? "$M,0,0,0*51\r\n" : frame_cur;
+  strcpy(frame_tx, f);
+  dbg_last = HAL_UART_Transmit_IT(&huart2, (uint8_t *)frame_tx, strlen(frame_tx));
+  if (dbg_last == HAL_OK) dbg_ok++;
+  else dbg_err++;
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *h)
+{
+  if (h->Instance == USART2) dbg_done++;                          /* the whole frame left the TX pin */
+}
+
+static void link_debug_print(void)
+{
+  static const char *const st[] = {"HAL_OK", "HAL_ERROR", "HAL_BUSY", "HAL_TIMEOUT"};
+  char line[200];
+  snprintf(line, sizeof line,
+           "LINK TX: tim6 %lu, Transmit_IT %s x%lu, busy %lu, fail %lu, sent %lu, gState 0x%02lX, BRR %lu"
+           " | RX: %lu bytes, $O ok %lu bad %lu | last %s\r\n",
+           (unsigned long)dbg_ticks, st[dbg_last & 3], (unsigned long)dbg_ok, (unsigned long)dbg_busy,
+           (unsigned long)dbg_err, (unsigned long)dbg_done, (unsigned long)dbg_gstate,
+           (unsigned long)USART2->BRR, (unsigned long)dbg_rx_bytes, (unsigned long)dbg_rx_ok,
+           (unsigned long)dbg_rx_bad, last_frame);
   print(line);
-#if LINK_ON_USART2
-  extern UART_HandleTypeDef huart2;
-  HAL_UART_Transmit(&huart2, (uint8_t *)line + 3, strlen(line) - 3, 100);
-#endif
+}
+
+/* $M,0,0,0 every LINK_PERIOD_MS from now on (TIM6, 10 kHz count) */
+void link_start(void)
+{
+  link_send(0, 0, LINK_MODE_STOP);
+  __HAL_RCC_TIM6_CLK_ENABLE();
+  uint32_t clk = HAL_RCC_GetPCLK1Freq();
+  if ((RCC->CFGR & RCC_CFGR_PPRE1) != RCC_CFGR_PPRE1_DIV1) clk *= 2;   /* timer clock = 2 x PCLK1 */
+  TIM6->CR1 = 0;
+  TIM6->PSC = clk / 10000u - 1;
+  TIM6->ARR = LINK_PERIOD_MS * 10u - 1;
+  TIM6->EGR = TIM_EGR_UG;
+  TIM6->SR = 0;
+  TIM6->DIER = TIM_DIER_UIE;
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 6, 0);       /* below the DCMI / USART2 interrupts */
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+  TIM6->CR1 = TIM_CR1_CEN;
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *h)
+{
+  if (h->Instance != USART2) return;
+  dbg_rx_bytes++;
+  rx_ring[rx_head] = rx_byte;
+  rx_head = (uint16_t)((rx_head + 1) % sizeof rx_ring);
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *h)
+{
+  if (h->Instance == USART2) HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   /* overrun / noise: listen again */
+}
+
+/* one complete line from the lower board */
+static void link_line(char *s, uint32_t now)
+{
+  char *star = strchr(s, '*');
+  if (s[0] != '$' || !star) { dbg_rx_bad++; return; }
+  if (xor_sum(s + 1, star) != (uint8_t)strtol(star + 1, NULL, 16)) { dbg_rx_bad++; return; }   /* bad checksum: drop */
+  int level, dist;
+  if (sscanf(s + 1, "O,%d,%d", &level, &dist) != 2) { dbg_rx_bad++; return; }
+  dbg_rx_ok++;
+  char line[64];
+  t_obst_rx = now;
+  obst_seen = 1;
+  if (link_lost) {
+    link_lost = 0;
+    print("LINK OK (lower board answers again)\r\n");
+  }
+  if (level != obst_level) {
+    if (level > 0) snprintf(line, sizeof line, "OBSTACLE level %d (~%d mm)\r\n", level, dist);
+    else snprintf(line, sizeof line, "CLEAR\r\n");
+    print(line);
+    link_now = 1;
+  }
+  obst_level = level;
+  obst_dist = dist;
+}
+
+static void link_rx_poll(uint32_t now)
+{
+  while (rx_tail != rx_head) {
+    char c = (char)rx_ring[rx_tail];
+    rx_tail = (uint16_t)((rx_tail + 1) % sizeof rx_ring);
+    if (c == '\r') continue;
+    if (c == '\n' || rx_len >= (int)sizeof rx_line - 1) {
+      rx_line[rx_len] = 0;
+      link_line(rx_line, now);
+      rx_len = 0;
+    } else {
+      rx_line[rx_len++] = c;
+    }
+  }
+  /* the lower board has talked before and went quiet: stop and say so */
+  if (obst_seen && !link_lost && ELAPSED(now, t_obst_rx) > LINK_RX_TIMEOUT_MS) {
+    link_lost = 1;
+    obst_level = 0;
+    print("LINK LOST: no $O from the lower board\r\n");
+    link_now = 1;
+  }
 }
 
 /* ---- pan servo ---- */
@@ -189,38 +360,67 @@ static int in_position(void)
   return fabsf(bearing) <= CENTER_TOL_DEG && fabsf(dist_mm - TARGET_DIST_MM) <= DIST_TOL_MM;
 }
 
-/* What the robot should do now. Only meaningful while the target is in view (M_FOUND). */
+/* What the wheels should do now. They only move while the target is in view (M_FOUND). */
 static drive_t decide_drive(void)
 {
-  drive_t d = {0, 0, ""};
+  drive_t d = {0, 0, LINK_MODE_STOP, ""};
+  if (link_lost) {
+    snprintf(d.text, sizeof d.text, "STOP (lower board not answering)");
+    return d;
+  }
   if (mode != M_FOUND) {
     snprintf(d.text, sizeof d.text, mode == M_SEARCH ? "STOP (searching)" : "STOP (no tag)");
     return d;
   }
   int off = (int)lroundf(bearing);                       /* + = tag is to the right */
   int err = (int)lroundf(dist_mm) - TARGET_DIST_MM;      /* + = too far */
-  int len = 0;
-
-  if (abs(off) > CENTER_TOL_DEG) {
-    d.turn = off > TURN_MAX_DEG ? TURN_MAX_DEG : (off < -TURN_MAX_DEG ? -TURN_MAX_DEG : off);
-    len += snprintf(d.text + len, sizeof d.text - len, "TURN %s %d deg", off > 0 ? "RIGHT" : "LEFT", abs(off));
-  }
-  if (abs(off) > ALIGN_DEG) {
-    snprintf(d.text + len, sizeof d.text - len, " first");   /* far off to the side: turn on the spot */
+  int len = 0, steer = 0;
+  d.link_mode = err <= DOCK_ZONE_MM ? LINK_MODE_DOCKING : LINK_MODE_DRIVE;
+  if (obst_level >= 2) {                                 /* the lower board blocks forward anyway */
+    snprintf(d.text, sizeof d.text, "WAIT (obstacle ~%d mm)", obst_dist);
     return d;
   }
+
+  if (abs(off) > CENTER_TOL_DEG) {
+    steer = off * WHEEL_PCT_PER_DEG;
+    if (steer > WHEEL_STEER_MAX) steer = WHEEL_STEER_MAX;
+    if (steer < -WHEEL_STEER_MAX) steer = -WHEEL_STEER_MAX;
+    len += snprintf(d.text + len, sizeof d.text - len, "TURN %s %d deg", off > 0 ? "RIGHT" : "LEFT", abs(off));
+  }
+  if (abs(off) > ALIGN_DEG) {                            /* far off to the side: turn on the spot */
+    d.left = off > 0 ? WHEEL_SPIN : -WHEEL_SPIN;
+    d.right = -d.left;
+    snprintf(d.text + len, sizeof d.text - len, " first");
+    return d;
+  }
+  int v = 0;
   if (err > DIST_TOL_MM) {
     float k = (float)(err - DIST_TOL_MM) / SLOW_DOWN_MM;
     if (k > 1) k = 1;
-    d.speed = DRIVE_SPEED_MIN + (int)lroundf(k * (DRIVE_SPEED_MAX - DRIVE_SPEED_MIN));
+    v = WHEEL_FWD_MIN + (int)lroundf(k * (WHEEL_FWD_MAX - WHEEL_FWD_MIN));
     snprintf(d.text + len, sizeof d.text - len, "%sMOVE CLOSER %d mm", len ? ", " : "", err);
   } else if (err < -DIST_TOL_MM) {
-    d.speed = -REVERSE_SPEED;
+    v = -WHEEL_REVERSE;
     snprintf(d.text + len, sizeof d.text - len, "%sMOVE BACK %d mm", len ? ", " : "", -err);
   } else if (!len) {
     snprintf(d.text, sizeof d.text, "HOLD (in position)");
   }
+  d.left = clamp_pct(v + steer);                         /* turning right = left wheels faster */
+  d.right = clamp_pct(v - steer);
   return d;
+}
+
+/* Newest command for the TIM6 sender, every main-loop pass; after a state
+   change the frame goes out at once instead of at the next 100 ms tick */
+static void link_tick(uint32_t now)
+{
+  (void)now;
+  drive_t d = decide_drive();
+  link_send(d.left, d.right, d.link_mode);
+  if (link_now) {
+    link_now = 0;
+    TIM6->EGR = TIM_EGR_UG;           /* update event: the interrupt sends now and restarts the 100 ms */
+  }
 }
 
 static void back_to_select(void)
@@ -228,7 +428,7 @@ static void back_to_select(void)
   mode = M_SELECT;
   pan = 0;
   servo_write(0);
-  link_send(0, 0);
+  link_send(0, 0, LINK_MODE_STOP);
   ui_show_select(selected);
 }
 
@@ -253,6 +453,7 @@ static void reset_search(void)
   mode = M_SEARCH;
   t_state = HAL_GetTick();
   beat_now = 1;
+  link_now = 1;
 }
 
 /* food taken (or timeout): drive back to the start-point tag */
@@ -285,6 +486,7 @@ static void enter(mission_t m, uint32_t now)
   mode = m;
   t_state = now;
   beat_now = 1;
+  link_now = 1;
 }
 
 void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int rotation, uint32_t now)
@@ -327,7 +529,7 @@ void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int
                  goal(), (int)lroundf(dist_mm), (int)lroundf(bearing));
         print(line);
         enter(M_ARRIVED, now);
-        link_send(0, 0);
+        link_send(0, 0, LINK_MODE_STOP);
         if (!returning) ui_show_received(1);   /* the customer confirms with this button */
         return;
       }
@@ -355,6 +557,14 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   uint32_t dt = now - t_poll;
   t_poll = now;
   if (dt > 200) dt = 200;
+  link_rx_poll(now);
+#if LINK_DEBUG
+  static uint32_t t_dbg = 0;
+  if (now - t_dbg >= output_delay) {
+    t_dbg = now;
+    link_debug_print();
+  }
+#endif
 
   /* touch */
   char line[64];
@@ -377,16 +587,27 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
       back_to_select();
     }
   }
-  if (mode == M_SELECT) return;
+  if (mode == M_SELECT) {
+    link_tick(now);                   /* $M,0,0,0 keeps the lower board's watchdog fed */
+    return;
+  }
   /* a touch may have started a mission (redraw + delay): read the clock again */
   now = HAL_GetTick();
   t_poll = now;
+
+  /* someone in the way (lower board's ToF): the mission's clocks stand still */
+  int blocked = obst_level >= 2 && !link_lost;
+  if (blocked) {
+    t_state += dt;
+    if (t_seen) t_seen += dt;
+    t_in_pos = 0;
+  }
 
   switch (mode) {
   case M_SEARCH:
     /* target seen but not confirmed yet: pan_update() holds the camera on it */
     if (t_seen && ELAPSED(now, t_seen) < LOST_MS) break;
-    if (PAN_SERVO_ENABLED) {
+    if (PAN_SERVO_ENABLED && !blocked) {
       pan += sweep_dir * (float)SWEEP_DEG_PER_S * dt / 1000.0f;
       if (pan >= PAN_LIMIT_DEG) { pan = PAN_LIMIT_DEG; sweep_dir = -1; }
       if (pan <= -PAN_LIMIT_DEG) { pan = -PAN_LIMIT_DEG; sweep_dir = 1; }
@@ -431,6 +652,12 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
   if (mode == M_ARRIVED) {
     ui_set_eyes(EYES_HAPPY, 0);
     ui_set_status(returning ? STATUS_HOME : STATUS_ARRIVED, target);
+  } else if (link_lost) {
+    ui_set_eyes(EYES_WAIT, dx);
+    ui_set_status(STATUS_LINK_LOST, 0);
+  } else if (blocked) {
+    ui_set_eyes(EYES_WAIT, dx);
+    ui_set_status(STATUS_OBSTACLE, 0);
   } else if (returning) {
     ui_set_eyes(mode == M_FOUND ? EYES_FOUND : (mode == M_WAIT ? EYES_WAIT : EYES_SEARCH), dx);
     ui_set_status(STATUS_GOING_HOME, 0);
@@ -448,18 +675,21 @@ void delivery_poll(uint32_t now, uint32_t output_delay)
     ui_set_status(STATUS_SEARCHING, target);
   }
 
-  /* drive command: at every change and every output_delay */
+  link_tick(now);
+
+  /* result lines for Tera Term: at every change and every output_delay */
   if (beat_now || now - t_beat >= output_delay) {
     beat_now = 0;
     t_beat = now;
     drive_t d = decide_drive();
+    char line2[80];
     if (mode == M_FOUND) print_found();
     if (mode != M_ARRIVED && mode != M_NOT_FOUND) {
-      char hint[80];
-      snprintf(hint, sizeof hint, "DRIVE %s\r\n", d.text);
-      print(hint);
+      snprintf(line2, sizeof line2, "DRIVE %s\r\n", d.text);
+      print(line2);
     }
-    link_send(d.speed, d.turn);
+    snprintf(line2, sizeof line2, "-> %s\r\n", last_frame);   /* what the lower board gets */
+    print(line2);
   }
 }
 
@@ -469,13 +699,20 @@ void delivery_init(void)
   ui_init();
   ui_show_select(0);
   t_poll = HAL_GetTick();
-  print("touch a table on the screen (TABLE / FOUND / DRIVE / INVALID / ARRIVED / RECEIVED / RETURN lines and -> $D commands follow)\r\n");
+  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);   /* $O lines from the lower board */
+  link_send(0, 0, LINK_MODE_STOP);
+  print("touch a table on the screen (TABLE / FOUND / DRIVE / INVALID / ARRIVED / RECEIVED / RETURN lines and -> $M wheel commands follow)\r\n");
 }
 
 const char *delivery_status(void)
 {
   static char buf[112];
   uint32_t now = HAL_GetTick();
+  if (link_lost) return "LOWER BOARD NOT ANSWERING (no $O) - wheels stopped";
+  if (obst_level >= 2 && mode != M_SELECT) {
+    snprintf(buf, sizeof buf, "OBSTACLE level %d ~%d mm - waiting (%s)", obst_level, obst_dist, goal());
+    return buf;
+  }
   switch (mode) {
   case M_SEARCH: {
     int left = (SEARCH_TIMEOUT_MS - ELAPSED(now, t_state) + 999) / 1000;

@@ -21,6 +21,8 @@ extern const mono_bmp_t TXT_NOT_FOUND;     /* ไม่พบโต๊ะ  (72x2
 extern const mono_bmp_t TXT_GOING_HOME;    /* กำลังกลับจุดเริ่มต้น  (143x24) */
 extern const mono_bmp_t TXT_HOME_ARRIVED;  /* ถึงจุดเริ่มต้นแล้ว  (119x24) */
 extern const mono_bmp_t TXT_RECEIVED;      /* รับอาหารแล้ว  (99x24) */
+extern const mono_bmp_t TXT_PLEASE_MOVE;   /* กรุณาหลบหน่อยครับ  (158x24) */
+extern const mono_bmp_t TXT_LINK_LOST;     /* บอร์ดล่างไม่ตอบ  (123x24) */
 extern const mono_bmp_t TXT_CANCEL;        /* ยกเลิก  (35x14) */
 extern const mono_bmp_t TXT_TAG_FAMILY;    /* · tag36h11  (66x14) */
 

@@ -58,6 +58,8 @@ TEXTS = {
     "TXT_GOING_HOME":     ("STATUS", "กำลังกลับจุดเริ่มต้น"),
     "TXT_HOME_ARRIVED":   ("STATUS", "ถึงจุดเริ่มต้นแล้ว"),
     "TXT_RECEIVED":       ("STATUS", "รับอาหารแล้ว"),
+    "TXT_PLEASE_MOVE":    ("STATUS", "กรุณาหลบหน่อยครับ"),
+    "TXT_LINK_LOST":      ("STATUS", "บอร์ดล่างไม่ตอบ"),
     "TXT_CANCEL":         ("SMALL",  "ยกเลิก"),
     "TXT_TAG_FAMILY":     ("SMALL",  "· tag36h11"),
 }
@@ -242,6 +244,8 @@ def write_preview(bitmaps, rows):
         ["TXT_RECEIVED"],
         ["TXT_GOING_HOME"],
         ["TXT_HOME_ARRIVED"],
+        ["TXT_PLEASE_MOVE"],
+        ["TXT_LINK_LOST"],
         ["TXT_CANCEL"],
         ["SMALL:73", "SMALL:68", "SMALL:32", "SMALL:51", "SMALL:32", "TXT_TAG_FAMILY"],
     ]

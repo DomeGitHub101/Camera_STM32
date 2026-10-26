@@ -128,6 +128,7 @@ static void cv_mono(const mono_bmp_t *b, int x0, int y0, uint16_t colour)
 /* send the canvas to the LCD at (x, y) */
 static void cv_send(int x, int y)
 {
+  if (!LCD_ENABLE) return;
   ILI9341_Set_Address(x, y, x + cv_w - 1, y + cv_h - 1);
   HAL_GPIO_WritePin(LCD_DC_PORT, LCD_DC_PIN, GPIO_PIN_SET);
   HAL_GPIO_WritePin(LCD_CS_PORT, LCD_CS_PIN, GPIO_PIN_RESET);
@@ -215,7 +216,7 @@ static void draw_table_button(int i, int selected)
 
 void ui_show_select(int selected)
 {
-  ILI9341_Fill_Screen(C_BG);
+  if (LCD_ENABLE) ILI9341_Fill_Screen(C_BG);
   line_t l = {0};
   line_bmp(&l, &TXT_TITLE);
   draw_centered_line(&l, TITLE_Y, C_TEXT);
@@ -302,10 +303,19 @@ void ui_set_status(ui_status_t status, int n)
     line_bmp(&l, &TXT_HOME_ARRIVED);
     colour = C_GREEN;
     break;
+  case STATUS_OBSTACLE:
+    line_bmp(&l, &TXT_PLEASE_MOVE);
+    colour = C_ORANGE;
+    break;
+  case STATUS_LINK_LOST:
+    line_bmp(&l, &TXT_LINK_LOST);
+    colour = C_RED;
+    break;
   default:
     break;
   }
-  if (status != STATUS_NONE && status != STATUS_GOING_HOME && status != STATUS_HOME) {
+  if (status == STATUS_SEARCHING || status == STATUS_WRONG || status == STATUS_FOUND ||
+      status == STATUS_ARRIVED || status == STATUS_NOT_FOUND) {
     line_str(&l, &FONT_STATUS, " ");
     line_num(&l, &FONT_STATUS, n);
   }
@@ -318,7 +328,7 @@ void ui_set_status(ui_status_t status, int n)
 
 void ui_show_mission(int table)
 {
-  ILI9341_Fill_Screen(C_BG);
+  if (LCD_ENABLE) ILI9341_Fill_Screen(C_BG);
   cur_eyes = -1;
   cur_status = -1;
   received_shown = 0;
@@ -442,6 +452,7 @@ int ui_poll_touch(int *x, int *y)
 void ui_init(void)
 {
   /* LCD and touch pins, EXTI2 and SPI5 are set up by CubeMX (gpio.c, spi.c) */
+  if (!LCD_ENABLE) return;
   ILI9341_Init();                                 /* also runs MX_SPI5_Init() */
   ILI9341_Set_Rotation(SCREEN_HORIZONTAL_1);      /* landscape 320x240 */
 }

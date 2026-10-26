@@ -193,6 +193,8 @@ def main():
                     help="must match UART_BAUD in main.c (default: try 2000000 and 115200)")
     ap.add_argument("--scale", type=int, default=0,
                     help="window zoom factor (default: auto, about 640 px wide)")
+    ap.add_argument("--no-rotate", action="store_true",
+                    help="show the picture as the sensor sends it (landscape 160x120), ignoring @ROT")
     args = ap.parse_args()
 
     port = args.port or find_port()
@@ -287,7 +289,8 @@ def main():
                     _, w, h, pixels = item
                     image = np.frombuffer(pixels, dtype=np.uint8).reshape(h, w)
                     shown_tags, pending_tags = pending_tags, []
-                    image, shown_tags = rotate_upright(image, shown_tags, rotation)
+                    if not args.no_rotate:
+                        image, shown_tags = rotate_upright(image, shown_tags, rotation)
                     h, w = image.shape
                     frames += 1
                     t_last = time.time()
