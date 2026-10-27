@@ -77,12 +77,13 @@
 /* ---- camera signal checks ---- */
 #define OV7670_TEST_PATTERN 0       /* 1 = colour bars instead of the picture (key p toggles at run time) */
 #define OV7670_PCLK_DIV    1        /* 1 = normal, 2 / 4 = slower PCLK for long jumper wires (fewer fps) */
-#define CAMERA_ROTATION    270      /* how far to turn the picture clockwise to make it upright: 0 / 90 / 180 / 270.
-                                       The camera is soldered on its side; the sensor cannot turn 90 deg,
-                                       so the left/right angle is taken from the matching image axis and
+#define CAMERA_ROTATION    180      /* how far to turn the picture clockwise to make it upright: 0 / 90 / 180 / 270.
+                                       0 = camera mounted level (landscape). If it is mounted on its side,
+                                       the left/right angle is taken from the matching image axis and
                                        the viewer turns the picture (detection works in any orientation) */
-#define CAM_STATS          1        /* 1 = print a CAM: line (frame size / errors) with every result line */
+#define CAM_STATS          0        /* 1 = print a CAM: line (frame size / errors) with every result line */
 #define DROP_BAD_FRAMES    1        /* 1 = no tag detection on frames with wrong size or DCMI errors */
+#define SHOW_BAD_FRAMES    0        /* 1 = the viewer also gets the bad frames (stripes / shifted lines) */
 #define FRAME_MARGIN       (4 * OV7670_WIDTH * 2)   /* DMA room for 4 extra lines, to measure long frames */
 #define CAP_BYTES          (OV7670_FRAME_BYTES + FRAME_MARGIN)
 #define ROW_TOLERANCE      12       /* test pattern: mean |Y difference| for a row to count as wrong */
@@ -490,7 +491,7 @@ static void print_help(void)
 #if !APP_DELIVERY
   uart_print("tag ID -> command: 0 STOP, 1 FORWARD, 2 TURN_LEFT, 3 TURN_RIGHT, 4 BACKWARD\r\n");
 #endif
-  snprintf(line, sizeof line, "output delay %lu ms  (keys: + slower, - faster, p test pattern, h help)\r\n",
+  snprintf(line, sizeof line, "output delay %lu ms  (keys: + slower, - faster, p test pattern, s servo test, h help)\r\n",
            (unsigned long)output_delay);
   uart_print(line);
 }
@@ -524,6 +525,11 @@ static void handle_key(int c)
     uart_print(test_pattern ? "test pattern ON (colour bars)\r\n" : "test pattern OFF\r\n");
     memset(&cam, 0, sizeof cam);
     break;
+#if APP_DELIVERY
+  case 's':
+    delivery_servo_test();
+    break;
+#endif
   case 'h':
   case '?':
     print_help();
@@ -686,7 +692,14 @@ int main(void)
     snprintf(msg, sizeof msg, "  failed at reg 0x%02X, HAL I2C error 0x%08lX\r\n",
              ov7670_last_reg, (unsigned long)HAL_I2C_GetError(&hi2c2));
     uart_print(msg);
+#if APP_DELIVERY
+    uart_print("  (s = servo test still works)\r\n");
+    while (1) {
+      if (uart_getc() == 's') delivery_servo_test();
+    }
+#else
     while (1) {}
+#endif
   }
   uint8_t pid = 0, ver = 0;
   OV7670_ReadReg(0x0A, &pid);
@@ -774,7 +787,7 @@ int main(void)
       start_capture();
       t_cap = HAL_GetTick();
 
-      /* a bad frame gets no detection, but the viewer still shows what the DCMI received */
+      /* a bad frame gets no detection (and is not sent to the viewer unless SHOW_BAD_FRAMES) */
       int n = 0;
       if (good || !DROP_BAD_FRAMES) {
         uint32_t c0 = DWT->CYCCNT;
@@ -798,7 +811,7 @@ int main(void)
 #endif
       }
 
-      if (video_mode) {
+      if (video_mode && (good || SHOW_BAD_FRAMES)) {
         send_tag_lines(n);
         send_video();
       }

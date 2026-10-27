@@ -118,11 +118,12 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* timHandle)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN TIM2_MspPostInit 1 */
-    /* XCLK 13.5 MHz: Medium is enough for it, and the softer edges stop it
-       coupling into the PCLK wire next to it (with Very High every frame got
-       extra PCLK edges: "long" frames, Y/U byte slips). Kept here so a CubeMX
-       regeneration (which sets Low) does not change it. */
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
+    /* XCLK 13.5 MHz: Low still drives it, and the softer edges stop it
+       coupling into the PCLK wire next to it (faster edges give extra PCLK
+       edges: "long" frames, shifted lines / stripes in the picture; Medium was
+       enough with the old wiring, not after the camera mount was rebuilt).
+       Kept here so the speed stays a deliberate choice if CubeMX changes it. */
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
   /* USER CODE END TIM2_MspPostInit 1 */
   }

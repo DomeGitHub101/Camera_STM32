@@ -17,6 +17,9 @@ void delivery_frame(const at_detection_t *dets, int n, int img_w, int img_h, int
 /* every main-loop pass: touch, servo sweep, timers, link heartbeat every output_delay ms */
 void delivery_poll(uint32_t now, uint32_t output_delay);
 
+/* step the pan servo one test angle further and print it ('s' key) */
+void delivery_servo_test(void);
+
 /* one-line mission state, e.g. "SEARCH table 3  9 s left", for the PC viewer */
 const char *delivery_status(void);
 

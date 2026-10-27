@@ -59,5 +59,9 @@ int ui_hit_cancel(int x, int y);   /* page 2: 1 = cancel button */
 /* page 2 at the table: "รับอาหารแล้ว" button (1 = draw, 0 = erase) */
 void ui_show_received(int show);
 int ui_hit_received(int x, int y); /* 1 = "รับอาหารแล้ว" touched (only while it is shown) */
+/* every main-loop pass: every 500 ms asks the panel whether it is still on;
+   if it reset itself (white) it is set up and redrawn. 1 = restored,
+   -1 = no answer on MISO (PF8): checking stops, 0 = nothing to do */
+int ui_lcd_check(uint32_t now);
 
 #endif /* CAT_UI_H */

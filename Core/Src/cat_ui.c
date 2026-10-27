@@ -70,6 +70,8 @@
 #define TP_ADC_Y_TOP     3740   /* y axis runs the other way on this panel: bottom (cancel button, y~221) read ~500 */
 #define TP_ADC_Y_BOTTOM  240
 #define TP_SAMPLES       16
+#define LCD_UPSIDE_DOWN  1      /* 1 = panel mounted upside down: picture and touch turned 180 deg
+                                   (the TP_ADC_ values above stay as calibrated for the upright panel) */
 #define TP_MAX_SPREAD    150    /* middle half of the samples must be this close */
 
 volatile uint32_t ui_touch_irq_count = 0;
@@ -214,8 +216,12 @@ static void draw_table_button(int i, int selected)
   cv_send(BTN_X0 + col * (BTN_W + BTN_GAP), BTN_Y0 + row * (BTN_H + BTN_GAP));
 }
 
+static int page = 0, page_arg = 0;   /* what is on screen, for ui_lcd_check(): 1 = select, 2 = mission */
+
 void ui_show_select(int selected)
 {
+  page = 1;
+  page_arg = selected;
   if (LCD_ENABLE) ILI9341_Fill_Screen(C_BG);
   line_t l = {0};
   line_bmp(&l, &TXT_TITLE);
@@ -328,6 +334,8 @@ void ui_set_status(ui_status_t status, int n)
 
 void ui_show_mission(int table)
 {
+  page = 2;
+  page_arg = table;
   if (LCD_ENABLE) ILI9341_Fill_Screen(C_BG);
   cur_eyes = -1;
   cur_status = -1;
@@ -370,6 +378,40 @@ void ui_show_received(int show)
 int ui_hit_received(int x, int y)
 {
   return received_shown && x >= RECV_X && x < RECV_X + RECV_W && y >= RECV_Y - 8;
+}
+
+/* ---- the panel resets itself (white screen) when the motors kick in ----
+   RDDPM (0x0A): bit 4 = sleep out, bit 2 = display on, bit 3 = normal mode
+   (set even right after a reset, so 0x00 / 0xFF = MISO not answering). */
+#define LCD_CHECK_MS     500
+
+int ui_lcd_check(uint32_t now)
+{
+  static uint32_t t_check = 0;
+  static int bad_reads = 0;
+  if (!LCD_ENABLE || !page || bad_reads >= 5 || now - t_check < LCD_CHECK_MS) return 0;
+  t_check = now;
+  uint8_t pm = ILI9341_Read_Reg8(0x0A);
+  if (pm == 0x00 || pm == 0xFF || !(pm & 0x08)) {
+    if (++bad_reads >= 5) return -1;   /* no read-back on this wiring: give up checking */
+    return 0;
+  }
+  bad_reads = 0;
+  if ((pm & 0x14) == 0x14) return 0;   /* awake and on: fine */
+
+  /* set the panel up again and redraw what was on it */
+  int eyes = cur_eyes, dx = cur_dx, st = cur_status, st_n = cur_status_n, recv = received_shown;
+  ILI9341_Init_Regs(5);
+  ILI9341_Set_Rotation(LCD_UPSIDE_DOWN ? SCREEN_HORIZONTAL_2 : SCREEN_HORIZONTAL_1);
+  if (page == 1) {
+    ui_show_select(page_arg);
+  } else {
+    ui_show_mission(page_arg);
+    if (eyes >= 0) ui_set_eyes((ui_eyes_t)eyes, dx);
+    if (st >= 0) ui_set_status((ui_status_t)st, st_n);
+    if (recv) ui_show_received(1);
+  }
+  return 1;
 }
 
 /* ---- touch: EXTI2_IRQHandler (stm32f7xx_it.c, CubeMX) calls this ---- */
@@ -443,6 +485,10 @@ int ui_poll_touch(int *x, int *y)
   if (sx >= SCR_W) sx = SCR_W - 1;
   if (sy < 0) sy = 0;
   if (sy >= SCR_H) sy = SCR_H - 1;
+#if LCD_UPSIDE_DOWN
+  sx = SCR_W - 1 - sx;                /* the panel turned round, the touch layer with it */
+  sy = SCR_H - 1 - sy;
+#endif
   *x = sx;
   *y = sy;
   return 1;
@@ -454,5 +500,5 @@ void ui_init(void)
   /* LCD and touch pins, EXTI2 and SPI5 are set up by CubeMX (gpio.c, spi.c) */
   if (!LCD_ENABLE) return;
   ILI9341_Init();                                 /* also runs MX_SPI5_Init() */
-  ILI9341_Set_Rotation(SCREEN_HORIZONTAL_1);      /* landscape 320x240 */
+  ILI9341_Set_Rotation(LCD_UPSIDE_DOWN ? SCREEN_HORIZONTAL_2 : SCREEN_HORIZONTAL_1);   /* landscape 320x240 */
 }

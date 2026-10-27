@@ -204,6 +204,18 @@ ILI9341_Reset();
 ILI9341_Write_Command(0x01);
 HAL_Delay(1000);
 
+ILI9341_Init_Regs(120);
+
+//STARTING ROTATION
+ILI9341_Set_Rotation(SCREEN_VERTICAL_1);
+}
+
+/* The register set-up of ILI9341_Init() without the resets: brings back a
+   panel that reset itself (white screen) in a few ms. sleep_out_ms = wait
+   after SLEEP OUT (datasheet: 5 ms before the next command). The rotation
+   (0x36) has to be set again afterwards. */
+void ILI9341_Init_Regs(uint32_t sleep_out_ms)
+{
 //POWER CONTROL A
 ILI9341_Write_Command(0xCB);
 ILI9341_Write_Data(0x39);
@@ -322,13 +334,29 @@ ILI9341_Write_Data(0x0F);
 
 //EXIT SLEEP
 ILI9341_Write_Command(0x11);
-HAL_Delay(120);
+HAL_Delay(sleep_out_ms);
 
 //TURN ON DISPLAY
 ILI9341_Write_Command(0x29);
+}
 
-//STARTING ROTATION
-ILI9341_Set_Rotation(SCREEN_VERTICAL_1);
+/* Reads one 8-bit status register (e.g. 0x0A display power mode) over MISO
+   (PF8). Reads need a slower clock than writes: SPI5 runs at /32 meanwhile. */
+uint8_t ILI9341_Read_Reg8(uint8_t Command)
+{
+uint8_t v = 0;
+uint32_t br = (HSPI_INSTANCE)->Instance->CR1 & SPI_CR1_BR;
+__HAL_SPI_DISABLE(HSPI_INSTANCE);
+MODIFY_REG((HSPI_INSTANCE)->Instance->CR1, SPI_CR1_BR, SPI_BAUDRATEPRESCALER_32);
+HAL_GPIO_WritePin(LCD_CS_PORT, LCD_CS_PIN, GPIO_PIN_RESET);
+HAL_GPIO_WritePin(LCD_DC_PORT, LCD_DC_PIN, GPIO_PIN_RESET);
+ILI9341_SPI_Send(Command);
+HAL_GPIO_WritePin(LCD_DC_PORT, LCD_DC_PIN, GPIO_PIN_SET);
+HAL_SPI_Receive(HSPI_INSTANCE, &v, 1, 2);
+HAL_GPIO_WritePin(LCD_CS_PORT, LCD_CS_PIN, GPIO_PIN_SET);
+__HAL_SPI_DISABLE(HSPI_INSTANCE);
+MODIFY_REG((HSPI_INSTANCE)->Instance->CR1, SPI_CR1_BR, br);
+return v;
 }
 
 //INTERNAL FUNCTION OF LIBRARY, USAGE NOT RECOMENDED, USE Draw_Pixel INSTEAD
